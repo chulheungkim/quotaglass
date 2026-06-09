@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { ChevronDown, Minimize2, Maximize2 } from "lucide-react";
 import type { UsageStats, RateLimits, LimitWindow } from "./types";
 
 // ── model display helpers ─────────────────────────────────────────────────────
@@ -90,8 +91,8 @@ function ClaudeIcon() {
   return (
     <svg
       viewBox="0 0 24 24"
-      width="14"
-      height="14"
+      width="16"
+      height="16"
       fill="#D97757"
       xmlns="http://www.w3.org/2000/svg"
       style={{ flexShrink: 0 }}
@@ -266,47 +267,17 @@ export default function App() {
             onClick={toggleUltra}
             title={ultra ? "Show details" : "Ultra compact"}
           >
-            <svg
-              viewBox="0 0 10 9"
-              width="10"
-              height="9"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-            >
-              {ultra ? (
-                <>
-                  <line x1="1" y1="1.5" x2="9" y2="1.5" />
-                  <line x1="1" y1="4.5" x2="9" y2="4.5" />
-                  <line x1="1" y1="7.5" x2="9" y2="7.5" />
-                </>
-              ) : (
-                <>
-                  <line x1="1" y1="3" x2="9" y2="3" />
-                  <line x1="1" y1="6" x2="9" y2="6" />
-                </>
-              )}
-            </svg>
+            {ultra ? <Maximize2 size={11} /> : <Minimize2 size={11} />}
           </button>
           <button
             className="expand-btn"
             onClick={() => setExpanded((e) => !e)}
             title={expanded ? "Collapse" : "Expand"}
           >
-            <svg
-              viewBox="0 0 10 6"
-              width="10"
-              height="6"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+            <ChevronDown
+              size={11}
               className={`chevron ${expanded ? "chevron-up" : ""}`}
-            >
-              <path d="M1 1l4 4 4-4" />
-            </svg>
+            />
           </button>
         </div>
       </div>
