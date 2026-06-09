@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -8,6 +9,25 @@ use serde_json::Value;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
+
+// ── Rate-limit usage structs (for /api/oauth/usage) ──────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LimitWindow {
+    utilization: Option<f64>,
+    resets_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimits {
+    five_hour: Option<LimitWindow>,
+    seven_day: Option<LimitWindow>,
+    seven_day_sonnet: Option<LimitWindow>,
+}
+
+// ── Historical usage structs ──────────────────────────────────────────────────
 
 #[derive(Serialize)]
 pub struct DayStat {
@@ -275,6 +295,76 @@ fn get_usage_stats() -> Result<UsageStats, String> {
     })
 }
 
+fn read_oauth_token() -> Option<String> {
+    let username = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string());
+    let out = Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-a",
+            &username,
+            "-w",
+            "-s",
+            "Claude Code-credentials",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let creds_json = String::from_utf8(out.stdout).ok()?;
+    let v: Value = serde_json::from_str(creds_json.trim()).ok()?;
+    v.get("claudeAiOauth")?
+        .get("accessToken")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+#[tauri::command]
+fn get_rate_limits() -> Result<RateLimits, String> {
+    let token =
+        read_oauth_token().ok_or_else(|| "No OAuth token found in keychain".to_string())?;
+
+    let out = Command::new("/usr/bin/curl")
+        .args([
+            "-s",
+            "--max-time",
+            "8",
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+            "-H",
+            "anthropic-beta: oauth-2025-04-20",
+            "https://api.anthropic.com/api/oauth/usage",
+        ])
+        .output()
+        .map_err(|e| format!("curl error: {e}"))?;
+
+    let body = String::from_utf8(out.stdout).map_err(|e| format!("UTF-8 error: {e}"))?;
+    let data: Value = serde_json::from_str(&body).map_err(|e| {
+        let preview = &body[..body.len().min(120)];
+        format!("JSON error: {e}: {preview}")
+    })?;
+
+    let parse_window = |key: &str| -> Option<LimitWindow> {
+        let w = data.get(key)?;
+        if w.is_null() {
+            return None;
+        }
+        Some(LimitWindow {
+            utilization: w.get("utilization").and_then(|v| v.as_f64()),
+            resets_at: w
+                .get("resets_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    };
+
+    Ok(RateLimits {
+        five_hour: parse_window("five_hour"),
+        seven_day: parse_window("seven_day"),
+        seven_day_sonnet: parse_window("seven_day_sonnet"),
+    })
+}
+
 fn position_top_right(win: &tauri::WebviewWindow) {
     if let (Ok(Some(monitor)), Ok(wsize)) = (win.current_monitor(), win.outer_size()) {
         let m = monitor.size();
@@ -355,7 +445,7 @@ fn toggle_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_usage_stats])
+        .invoke_handler(tauri::generate_handler![get_usage_stats, get_rate_limits])
         .on_window_event(|window, event| {
             // Closing hides the widget instead of quitting; it lives in the menu bar.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

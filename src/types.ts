@@ -25,3 +25,14 @@ export interface UsageStats {
   since: string | null;
   lastUpdated: string;
 }
+
+export interface LimitWindow {
+  utilization: number | null;
+  resetsAt: string | null;
+}
+
+export interface RateLimits {
+  fiveHour: LimitWindow | null;
+  sevenDay: LimitWindow | null;
+  sevenDaySonnet: LimitWindow | null;
+}
