@@ -1,3 +1,5 @@
+@import url("https://fonts.googleapis.com/css2?family=Kaisei+Decol:wght@400;700;900&display=swap");
+
 * {
   box-sizing: border-box;
 }
@@ -42,22 +44,11 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-family: "Kaisei Decol", serif;
+  font-size: 15px;
   font-weight: 700;
   color: #fff;
-  letter-spacing: 0.2px;
-}
-
-/* Claude logo in a purple pill */
-.claude-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  background: #8b6fbf;
-  border-radius: 6px;
-  flex-shrink: 0;
+  letter-spacing: 0.1px;
 }
 
 /* expand/collapse chevron button */
