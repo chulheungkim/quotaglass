@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Kaisei+Decol:wght@400;700;900&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Crimson+Text:ital,wght@0,400;0,600;0,700;1,400&display=swap");
 
 * {
   box-sizing: border-box;
@@ -44,14 +44,22 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-family: "Kaisei Decol", serif;
-  font-size: 15px;
+  font-family: "Crimson Text", serif;
+  font-size: 14px;
   font-weight: 700;
   color: #fff;
   letter-spacing: 0.1px;
 }
 
-/* expand/collapse chevron button */
+/* header button group */
+.header-btns {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* shared base for all small header icon buttons */
+.header-btn,
 .expand-btn {
   background: none;
   border: none;
@@ -65,8 +73,21 @@ body {
   align-items: center;
 }
 
+.header-btn:hover,
 .expand-btn:hover {
   color: #ededf2;
+}
+
+/* ── ultra-compact bars ── */
+
+.ultra-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ultra-track {
+  height: 4px !important;
 }
 
 .chevron {

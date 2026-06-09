@@ -90,8 +90,8 @@ function ClaudeIcon() {
   return (
     <svg
       viewBox="0 0 24 24"
-      width="18"
-      height="18"
+      width="14"
+      height="14"
       fill="#D97757"
       xmlns="http://www.w3.org/2000/svg"
       style={{ flexShrink: 0 }}
@@ -142,7 +142,17 @@ export default function App() {
   const [limitsErr, setLimitsErr] = useState<string | null>(null);
   const [stats, setStats] = useState<UsageStats | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [ultra, setUltra] = useState(
+    () => localStorage.getItem("widget-ultra") === "1",
+  );
   const cardRef = useRef<HTMLDivElement>(null);
+
+  const toggleUltra = () =>
+    setUltra((u) => {
+      const next = !u;
+      localStorage.setItem("widget-ultra", next ? "1" : "0");
+      return next;
+    });
 
   // Rate limits — network call every 5 min
   useEffect(() => {
@@ -185,7 +195,7 @@ export default function App() {
     };
   }, []);
 
-  // Immediate resize when data changes (no animation needed)
+  // Immediate resize + re-anchor when data or mode changes
   useEffect(() => {
     const el = cardRef.current;
     if (!el) return;
@@ -193,13 +203,15 @@ export default function App() {
     if (h > 0)
       getCurrentWindow()
         .setSize(new LogicalSize(300, h))
+        .then(() => invoke("reanchor"))
         .catch(() => undefined);
-  }, [limits, limitsErr, stats]);
+  }, [limits, limitsErr, stats, ultra]);
 
-  // RAF-tracked resize during expand/collapse animation (~350 ms)
+  // RAF-tracked resize during expand/collapse animation, re-anchor at end
   useEffect(() => {
     let raf: number;
-    const deadline = Date.now() + 400;
+    const deadline = Date.now() + 420;
+    let anchored = false;
     const poll = () => {
       const el = cardRef.current;
       if (el) {
@@ -209,7 +221,12 @@ export default function App() {
             .setSize(new LogicalSize(300, h))
             .catch(() => undefined);
       }
-      if (Date.now() < deadline) raf = requestAnimationFrame(poll);
+      if (Date.now() < deadline) {
+        raf = requestAnimationFrame(poll);
+      } else if (!anchored) {
+        anchored = true;
+        invoke("reanchor").catch(() => undefined);
+      }
     };
     raf = requestAnimationFrame(poll);
     return () => cancelAnimationFrame(raf);
@@ -240,45 +257,105 @@ export default function App() {
       <div className="header">
         <div className="title">
           <ClaudeIcon />
-          Claude Code
+          {!ultra && <span>Claude Code</span>}
         </div>
-        <button
-          className="expand-btn"
-          onClick={() => setExpanded((e) => !e)}
-          title={expanded ? "Collapse" : "Expand"}
-        >
-          <svg
-            viewBox="0 0 10 6"
-            width="10"
-            height="6"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className={`chevron ${expanded ? "chevron-up" : ""}`}
+        <div className="header-btns">
+          {/* Ultra-compact toggle: 2 lines = compress, 3 lines = expand */}
+          <button
+            className="header-btn"
+            onClick={toggleUltra}
+            title={ultra ? "Show details" : "Ultra compact"}
           >
-            <path d="M1 1l4 4 4-4" />
-          </svg>
-        </button>
+            <svg
+              viewBox="0 0 10 9"
+              width="10"
+              height="9"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+            >
+              {ultra ? (
+                <>
+                  <line x1="1" y1="1.5" x2="9" y2="1.5" />
+                  <line x1="1" y1="4.5" x2="9" y2="4.5" />
+                  <line x1="1" y1="7.5" x2="9" y2="7.5" />
+                </>
+              ) : (
+                <>
+                  <line x1="1" y1="3" x2="9" y2="3" />
+                  <line x1="1" y1="6" x2="9" y2="6" />
+                </>
+              )}
+            </svg>
+          </button>
+          <button
+            className="expand-btn"
+            onClick={() => setExpanded((e) => !e)}
+            title={expanded ? "Collapse" : "Expand"}
+          >
+            <svg
+              viewBox="0 0 10 6"
+              width="10"
+              height="6"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className={`chevron ${expanded ? "chevron-up" : ""}`}
+            >
+              <path d="M1 1l4 4 4-4" />
+            </svg>
+          </button>
+        </div>
       </div>
 
-      {/* Primary: rate-limit bars */}
-      {limitsErr ? (
-        <div className="empty limits-err">{limitsErr}</div>
-      ) : !limits ? (
-        <div className="empty">Loading…</div>
-      ) : (
+      {/* Ultra-compact: 3 visual-only bars, no labels */}
+      {ultra && (
+        <div className="ultra-bars">
+          {[limits?.fiveHour, limits?.sevenDay, limits?.sevenDaySonnet].map(
+            (w, i) => {
+              const pct = w?.utilization ?? 0;
+              let color = "#8B6FBF";
+              if (pct >= 90) color = "#C95A8B";
+              else if (pct >= 70) color = "#D9844A";
+              return (
+                <div key={i} className="track ultra-track">
+                  <div
+                    className="fill"
+                    style={{
+                      width: `${Math.max(0.5, pct)}%`,
+                      background: color,
+                    }}
+                  />
+                </div>
+              );
+            },
+          )}
+        </div>
+      )}
+
+      {/* Normal compact: rate-limit bars with labels */}
+      {!ultra && (
         <>
-          <UsageBar title="Current session" window={limits.fiveHour} />
-          <UsageBar
-            title="Current week (all models)"
-            window={limits.sevenDay}
-          />
-          <UsageBar
-            title="Current week (Sonnet only)"
-            window={limits.sevenDaySonnet}
-          />
+          {limitsErr ? (
+            <div className="empty limits-err">{limitsErr}</div>
+          ) : !limits ? (
+            <div className="empty">Loading…</div>
+          ) : (
+            <>
+              <UsageBar title="Current session" window={limits.fiveHour} />
+              <UsageBar
+                title="Current week (all models)"
+                window={limits.sevenDay}
+              />
+              <UsageBar
+                title="Current week (Sonnet only)"
+                window={limits.sevenDaySonnet}
+              />
+            </>
+          )}
         </>
       )}
 

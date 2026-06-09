@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -365,15 +369,94 @@ fn get_rate_limits() -> Result<RateLimits, String> {
     })
 }
 
-fn position_top_right(win: &tauri::WebviewWindow) {
+// ── corner-placement system ───────────────────────────────────────────────────
+
+fn app_support_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("Library/Application Support/com.chulheong.claudeusage")
+}
+
+fn load_corner() -> String {
+    fs::read_to_string(app_support_dir().join(".corner"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| ["tl", "tr", "bl", "br"].contains(&s.as_str()))
+        .unwrap_or_else(|| "tr".to_string())
+}
+
+fn save_corner(corner: &str) {
+    let dir = app_support_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join(".corner"), corner.as_bytes());
+}
+
+fn position_at_corner(win: &tauri::WebviewWindow, corner: &str) {
     if let (Ok(Some(monitor)), Ok(wsize)) = (win.current_monitor(), win.outer_size()) {
-        let m = monitor.size();
+        let mp = monitor.position();
+        let ms = monitor.size();
         let scale = monitor.scale_factor();
-        let margin = (20.0 * scale) as i32;
-        let top = (44.0 * scale) as i32;
-        let x = (m.width as i32 - wsize.width as i32 - margin).max(0);
-        let _ = win.set_position(tauri::PhysicalPosition::new(x, top));
+        let mh = (10.0 * scale) as i32;
+        let mt = (44.0 * scale) as i32;
+        let mb = (10.0 * scale) as i32;
+
+        let x = if corner.ends_with('l') {
+            mp.x + mh
+        } else {
+            (mp.x + ms.width as i32 - wsize.width as i32 - mh).max(mp.x)
+        };
+        let y = if corner.starts_with('t') {
+            mp.y + mt
+        } else {
+            (mp.y + ms.height as i32 - wsize.height as i32 - mb).max(mp.y)
+        };
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
     }
+}
+
+fn snap_corner_impl(win: &tauri::WebviewWindow) {
+    let (pos, wsize, monitor) = match (
+        win.outer_position(),
+        win.outer_size(),
+        win.current_monitor(),
+    ) {
+        (Ok(p), Ok(ws), Ok(Some(m))) => (p, ws, m),
+        _ => return,
+    };
+    let mp = monitor.position();
+    let ms = monitor.size();
+    let cx = mp.x + ms.width as i32 / 2;
+    let cy = mp.y + ms.height as i32 / 2;
+    let wcx = pos.x + wsize.width as i32 / 2;
+    let wcy = pos.y + wsize.height as i32 / 2;
+    let corner = format!(
+        "{}{}",
+        if wcy < cy { 't' } else { 'b' },
+        if wcx < cx { 'l' } else { 'r' }
+    );
+    // Only move if it would actually change position to avoid event loops.
+    let scale = monitor.scale_factor();
+    let mh = (10.0 * scale) as i32;
+    let mt = (44.0 * scale) as i32;
+    let mb = (10.0 * scale) as i32;
+    let tx = if corner.ends_with('l') {
+        mp.x + mh
+    } else {
+        (mp.x + ms.width as i32 - wsize.width as i32 - mh).max(mp.x)
+    };
+    let ty = if corner.starts_with('t') {
+        mp.y + mt
+    } else {
+        (mp.y + ms.height as i32 - wsize.height as i32 - mb).max(mp.y)
+    };
+    if pos.x != tx || pos.y != ty {
+        let _ = win.set_position(tauri::PhysicalPosition::new(tx, ty));
+        save_corner(&corner);
+    }
+}
+
+#[tauri::command]
+fn reanchor(window: tauri::WebviewWindow) {
+    position_at_corner(&window, &load_corner());
 }
 
 // Native launch-at-login via SMAppService — the app registers itself as a
@@ -445,7 +528,7 @@ fn toggle_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_usage_stats, get_rate_limits])
+        .invoke_handler(tauri::generate_handler![get_usage_stats, get_rate_limits, reanchor])
         .on_window_event(|window, event| {
             // Closing hides the widget instead of quitting; it lives in the menu bar.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -494,7 +577,26 @@ pub fn run() {
             let _tray = tray.build(app)?;
 
             if let Some(win) = app.get_webview_window("main") {
-                position_top_right(&win);
+                position_at_corner(&win, &load_corner());
+
+                // Debounced corner-snap: after user stops dragging for 350 ms,
+                // snap to the nearest corner and persist the preference.
+                let snap_gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+                let snap_gen_ev = snap_gen.clone();
+                let win_ev = win.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Moved(_) = event {
+                        let gen = snap_gen_ev.fetch_add(1, Ordering::SeqCst) + 1;
+                        let gen_task = snap_gen_ev.clone();
+                        let win_task = win_ev.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(350));
+                            if gen_task.load(Ordering::SeqCst) == gen {
+                                snap_corner_impl(&win_task);
+                            }
+                        });
+                    }
+                });
             }
             Ok(())
         })
