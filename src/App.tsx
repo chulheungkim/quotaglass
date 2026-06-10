@@ -196,7 +196,7 @@ export default function App() {
     };
   }, []);
 
-  // Immediate resize + re-anchor when data or mode changes
+  // Immediate resize + re-anchor when data changes (no animation involved)
   useEffect(() => {
     const el = cardRef.current;
     if (!el) return;
@@ -206,9 +206,11 @@ export default function App() {
         .setSize(new LogicalSize(300, h))
         .then(() => invoke("reanchor"))
         .catch(() => undefined);
-  }, [limits, limitsErr, stats, ultra]);
+  }, [limits, limitsErr, stats]);
 
-  // RAF-tracked resize during expand/collapse animation, re-anchor at end
+  // RAF-tracked resize during animated transitions — polls every frame so the
+  // window tracks the card as it grows/shrinks, then re-anchors at end.
+  // Covers both expand/collapse (expanded) and mode switch (ultra).
   useEffect(() => {
     let raf: number;
     const deadline = Date.now() + 420;
@@ -231,7 +233,7 @@ export default function App() {
     };
     raf = requestAnimationFrame(poll);
     return () => cancelAnimationFrame(raf);
-  }, [expanded]);
+  }, [expanded, ultra]);
 
   const tokenRows = stats
     ? Object.entries(stats.modelTokens)
