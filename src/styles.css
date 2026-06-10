@@ -78,12 +78,48 @@ body {
   color: #ededf2;
 }
 
+/* ── mode switch animation (ultra ↔ default) ── */
+
+.mode-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.22s ease;
+}
+
+.mode-panel.visible {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.mode-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* title text slides away when ultra-compact */
+.title-text {
+  overflow: hidden;
+  white-space: nowrap;
+  max-width: 120px;
+  opacity: 1;
+  transition: max-width 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.2s ease;
+}
+
+.title-text.hidden {
+  max-width: 0;
+  opacity: 0;
+}
+
 /* ── ultra-compact bars ── */
 
 .ultra-bars {
   display: flex;
   flex-direction: column;
   gap: 5px;
+  padding-bottom: 2px;
 }
 
 .ultra-track {
