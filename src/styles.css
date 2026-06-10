@@ -81,20 +81,21 @@ body {
 /* ── mode switch animation (ultra ↔ default) ── */
 
 .mode-panel {
-  display: grid;
-  grid-template-rows: 0fr;
+  overflow: hidden;
+  max-height: 0;
   opacity: 0;
-  transition: grid-template-rows 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+  transition: max-height 0.32s cubic-bezier(0, 0, 0.2, 1),
               opacity 0.22s ease;
 }
 
-.mode-panel.visible {
-  grid-template-rows: 1fr;
+.ultra-panel.visible {
+  max-height: 30px;
   opacity: 1;
 }
 
-.mode-inner {
-  overflow: hidden;
+.normal-panel.visible {
+  max-height: 160px;
+  opacity: 1;
 }
 
 /* title text slides away when ultra-compact */

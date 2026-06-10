@@ -16,7 +16,7 @@ fi
 # ── 2. Build ──────────────────────────────────────────────────────────────────
 echo "→ Building..."
 cd "$(dirname "$0")/.."
-pnpm tauri build 2>&1
+pnpm tauri build --bundles app 2>&1
 
 # ── 3. Install ────────────────────────────────────────────────────────────────
 echo "→ Installing to $INSTALL_DIR..."

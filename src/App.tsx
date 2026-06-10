@@ -285,53 +285,49 @@ export default function App() {
       </div>
 
       {/* Ultra-compact: 3 visual-only bars, no labels */}
-      <div className={`mode-panel${ultra ? " visible" : ""}`}>
-        <div className="mode-inner">
-          <div className="ultra-bars">
-            {[limits?.fiveHour, limits?.sevenDay, limits?.sevenDaySonnet].map(
-              (w, i) => {
-                const pct = w?.utilization ?? 0;
-                let color = "#8B6FBF";
-                if (pct >= 90) color = "#C95A8B";
-                else if (pct >= 70) color = "#D9844A";
-                return (
-                  <div key={i} className="track ultra-track">
-                    <div
-                      className="fill"
-                      style={{
-                        width: `${Math.max(0.5, pct)}%`,
-                        background: color,
-                      }}
-                    />
-                  </div>
-                );
-              },
-            )}
-          </div>
+      <div className={`mode-panel ultra-panel${ultra ? " visible" : ""}`}>
+        <div className="ultra-bars">
+          {[limits?.fiveHour, limits?.sevenDay, limits?.sevenDaySonnet].map(
+            (w, i) => {
+              const pct = w?.utilization ?? 0;
+              let color = "#8B6FBF";
+              if (pct >= 90) color = "#C95A8B";
+              else if (pct >= 70) color = "#D9844A";
+              return (
+                <div key={i} className="track ultra-track">
+                  <div
+                    className="fill"
+                    style={{
+                      width: `${Math.max(0.5, pct)}%`,
+                      background: color,
+                    }}
+                  />
+                </div>
+              );
+            },
+          )}
         </div>
       </div>
 
       {/* Normal compact: rate-limit bars with labels */}
-      <div className={`mode-panel${ultra ? "" : " visible"}`}>
-        <div className="mode-inner">
-          {limitsErr ? (
-            <div className="empty limits-err">{limitsErr}</div>
-          ) : !limits ? (
-            <div className="empty">Loading…</div>
-          ) : (
-            <>
-              <UsageBar title="Current session" window={limits.fiveHour} />
-              <UsageBar
-                title="Current week (all models)"
-                window={limits.sevenDay}
-              />
-              <UsageBar
-                title="Current week (Sonnet only)"
-                window={limits.sevenDaySonnet}
-              />
-            </>
-          )}
-        </div>
+      <div className={`mode-panel normal-panel${ultra ? "" : " visible"}`}>
+        {limitsErr ? (
+          <div className="empty limits-err">{limitsErr}</div>
+        ) : !limits ? (
+          <div className="empty">Loading…</div>
+        ) : (
+          <>
+            <UsageBar title="Current session" window={limits.fiveHour} />
+            <UsageBar
+              title="Current week (all models)"
+              window={limits.sevenDay}
+            />
+            <UsageBar
+              title="Current week (Sonnet only)"
+              window={limits.sevenDaySonnet}
+            />
+          </>
+        )}
       </div>
 
       {/* Expandable details — always in DOM so CSS can animate height */}

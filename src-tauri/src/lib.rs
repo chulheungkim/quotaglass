@@ -269,7 +269,10 @@ fn get_usage_stats() -> Result<UsageStats, String> {
     let mut model_tokens: HashMap<String, i64> = HashMap::new();
     if let Some(mu) = cache.get("modelUsage").and_then(|v| v.as_object()) {
         for (model, usage) in mu {
-            let out = usage.get("outputTokens").and_then(|v| v.as_i64()).unwrap_or(0);
+            let out = usage
+                .get("outputTokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             model_tokens.insert(model.clone(), out);
         }
     }
@@ -280,8 +283,16 @@ fn get_usage_stats() -> Result<UsageStats, String> {
     let delta_sessions: i64 = ds.values().map(|s| s.len() as i64).sum();
     let delta_messages: i64 = dm.values().sum();
     let all_time = AllTime {
-        sessions: cache.get("totalSessions").and_then(|v| v.as_i64()).unwrap_or(0) + delta_sessions,
-        messages: cache.get("totalMessages").and_then(|v| v.as_i64()).unwrap_or(0) + delta_messages,
+        sessions: cache
+            .get("totalSessions")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            + delta_sessions,
+        messages: cache
+            .get("totalMessages")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            + delta_messages,
     };
 
     let since = cache
@@ -325,8 +336,7 @@ fn read_oauth_token() -> Option<String> {
 
 #[tauri::command]
 fn get_rate_limits() -> Result<RateLimits, String> {
-    let token =
-        read_oauth_token().ok_or_else(|| "No OAuth token found in keychain".to_string())?;
+    let token = read_oauth_token().ok_or_else(|| "No OAuth token found in keychain".to_string())?;
 
     let out = Command::new("/usr/bin/curl")
         .args([
@@ -480,6 +490,7 @@ mod login_item {
         result.is_ok()
     }
 
+    #[cfg(not(debug_assertions))]
     pub fn ensure_registered() {
         // Auto-enable login-at-launch only on the very first run. A marker file
         // records that we've done it, so if the user later turns it off (tray or
@@ -511,6 +522,7 @@ mod login_item {
     pub fn set(_enabled: bool) -> bool {
         false
     }
+    #[cfg(not(debug_assertions))]
     pub fn ensure_registered() {}
 }
 
@@ -528,7 +540,11 @@ fn toggle_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_usage_stats, get_rate_limits, reanchor])
+        .invoke_handler(tauri::generate_handler![
+            get_usage_stats,
+            get_rate_limits,
+            reanchor
+        ])
         .on_window_event(|window, event| {
             // Closing hides the widget instead of quitting; it lives in the menu bar.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
