@@ -94,7 +94,6 @@ body {
 }
 
 .mode-inner {
-  min-height: 0;
   overflow: hidden;
 }
 
