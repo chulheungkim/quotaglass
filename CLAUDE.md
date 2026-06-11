@@ -24,6 +24,10 @@ pnpm tauri build --bundles app
 
 There are no tests in this project.
 
+## Version Control
+
+GitButler is **not configured** for this repo. Use plain `git` for all commits, pushes, and branches — do not invoke the `/gitbutler` skill or `but` CLI here.
+
 ## Architecture
 
 ### Data flow
