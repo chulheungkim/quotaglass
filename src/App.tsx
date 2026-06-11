@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ChevronDown, Minimize2, Maximize2 } from "lucide-react";
 import type { UsageStats, RateLimits, LimitWindow } from "./types";
 
@@ -52,6 +53,17 @@ function fmtInt(n: number): string {
 function mmdd(s: string): string {
   const p = s.split("-");
   return p.length === 3 ? `${p[1]}/${p[2]}` : s;
+}
+
+function fmtCachedAt(ms: number): string {
+  const t = new Date(ms)
+    .toLocaleTimeString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    })
+    .replace(/ ([AP]M)/i, (_, m: string) => m.toLowerCase());
+  return `Last updated ${t}`;
 }
 
 // Matches Claude Code's own isQ() / WGA() formatter
@@ -111,9 +123,10 @@ function UsageBar({
   title: string;
   window: LimitWindow | null;
 }) {
-  if (!w) return null;
-  const pct = w.utilization ?? 0;
-  const resetStr = w.resetsAt ? formatReset(w.resetsAt) : null;
+  // Always render the bar — a null window (no data yet for this period) shows
+  // 0% rather than disappearing, so the panel is never blank.
+  const pct = w?.utilization ?? 0;
+  const resetStr = w?.resetsAt ? formatReset(w.resetsAt) : null;
 
   let fillColor = "#8B6FBF";
   if (pct >= 90) fillColor = "#C95A8B";
@@ -131,7 +144,7 @@ function UsageBar({
           style={{ width: `${Math.max(0.5, pct)}%`, background: fillColor }}
         />
       </div>
-      {resetStr && <div className="usage-reset">{resetStr}</div>}
+      <div className="usage-reset">{resetStr ?? "No recent usage"}</div>
     </div>
   );
 }
@@ -154,6 +167,19 @@ export default function App() {
       localStorage.setItem("widget-ultra", next ? "1" : "0");
       return next;
     });
+
+  // Grab anywhere: pressing on the card body starts a native window drag,
+  // except on interactive controls (the header buttons) which need their click.
+  // begin_drag arms the native mouse-up watcher that fires the corner snap the
+  // moment the button is released.
+  const onCardMouseDown = (e: ReactMouseEvent) => {
+    if (e.button !== 0) return; // primary button only
+    if (e.target instanceof Element && e.target.closest("button")) return;
+    invoke("begin_drag").catch(() => undefined);
+    getCurrentWindow()
+      .startDragging()
+      .catch(() => undefined);
+  };
 
   // Rate limits — network call every 5 min
   useEffect(() => {
@@ -196,39 +222,33 @@ export default function App() {
     };
   }, []);
 
-  // Immediate resize + re-anchor when data changes (no animation involved)
+  // Resize + reanchor when data arrives. set_height is atomic and skips
+  // repositioning while the user is dragging, so no mid-drag teleport.
   useEffect(() => {
     const el = cardRef.current;
     if (!el) return;
     const h = Math.ceil(el.getBoundingClientRect().height);
-    if (h > 0)
-      getCurrentWindow()
-        .setSize(new LogicalSize(300, h))
-        .then(() => invoke("reanchor"))
-        .catch(() => undefined);
+    if (h > 0) invoke("set_height", { h }).catch(() => undefined);
   }, [limits, limitsErr, stats]);
 
-  // RAF-tracked resize during animated transitions — polls every frame so the
-  // window tracks the card as it grows/shrinks, then re-anchors at end.
-  // Covers both expand/collapse (expanded) and mode switch (ultra).
+  // RAF-tracked resize during animated transitions. Calls set_height every
+  // frame so bottom-corner widgets grow upward correctly throughout the
+  // animation, not just at the end.
   useEffect(() => {
     let raf: number;
-    const deadline = Date.now() + 420;
-    let anchored = false;
+    const deadline = Date.now() + 650;
+    let lastH = 0;
     const poll = () => {
       const el = cardRef.current;
       if (el) {
         const h = Math.ceil(el.getBoundingClientRect().height);
-        if (h > 0)
-          getCurrentWindow()
-            .setSize(new LogicalSize(300, h))
-            .catch(() => undefined);
+        if (h > 0 && h !== lastH) {
+          lastH = h;
+          invoke("set_height", { h }).catch(() => undefined);
+        }
       }
       if (Date.now() < deadline) {
         raf = requestAnimationFrame(poll);
-      } else if (!anchored) {
-        anchored = true;
-        invoke("reanchor").catch(() => undefined);
       }
     };
     raf = requestAnimationFrame(poll);
@@ -255,7 +275,7 @@ export default function App() {
   );
 
   return (
-    <div className="card" data-tauri-drag-region ref={cardRef}>
+    <div className="card" ref={cardRef} onMouseDown={onCardMouseDown}>
       {/* Header */}
       <div className="header">
         <div className="title">
@@ -288,48 +308,53 @@ export default function App() {
 
       {/* Ultra-compact: 3 visual-only bars, no labels */}
       <div className={`mode-panel ultra-panel${ultra ? " visible" : ""}`}>
-        <div className="ultra-bars">
-          {[limits?.fiveHour, limits?.sevenDay, limits?.sevenDaySonnet].map(
-            (w, i) => {
-              const pct = w?.utilization ?? 0;
-              let color = "#8B6FBF";
-              if (pct >= 90) color = "#C95A8B";
-              else if (pct >= 70) color = "#D9844A";
-              return (
-                <div key={i} className="track ultra-track">
-                  <div
-                    className="fill"
-                    style={{
-                      width: `${Math.max(0.5, pct)}%`,
-                      background: color,
-                    }}
-                  />
-                </div>
-              );
-            },
-          )}
+        <div className="mode-panel-inner">
+          <div className="ultra-bars">
+            {[limits?.fiveHour, limits?.sevenDay, limits?.sevenDaySonnet].map(
+              (w, i) => {
+                const pct = w?.utilization ?? 0;
+                let color = "#8B6FBF";
+                if (pct >= 90) color = "#C95A8B";
+                else if (pct >= 70) color = "#D9844A";
+                return (
+                  <div key={i} className="track ultra-track">
+                    <div
+                      className="fill"
+                      style={{
+                        width: `${Math.max(0.5, pct)}%`,
+                        background: color,
+                      }}
+                    />
+                  </div>
+                );
+              },
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Normal compact: rate-limit bars with labels */}
+      {/* Normal compact: rate-limit bars with labels. Bars always render so
+          the panel is never blank — an error or loading note sits above them. */}
       <div className={`mode-panel normal-panel${ultra ? "" : " visible"}`}>
-        {limitsErr ? (
-          <div className="empty limits-err">{limitsErr}</div>
-        ) : !limits ? (
-          <div className="empty">Loading…</div>
-        ) : (
-          <>
-            <UsageBar title="Current session" window={limits.fiveHour} />
-            <UsageBar
-              title="Current week (all models)"
-              window={limits.sevenDay}
-            />
-            <UsageBar
-              title="Current week (Sonnet only)"
-              window={limits.sevenDaySonnet}
-            />
-          </>
-        )}
+        <div className="mode-panel-inner">
+          {limitsErr ? (
+            <div className="empty limits-err">{limitsErr}</div>
+          ) : !limits ? (
+            <div className="empty">Loading…</div>
+          ) : null}
+          <UsageBar title="Current session" window={limits?.fiveHour ?? null} />
+          <UsageBar
+            title="Current week (all models)"
+            window={limits?.sevenDay ?? null}
+          />
+          <UsageBar
+            title="Current week (Sonnet only)"
+            window={limits?.sevenDaySonnet ?? null}
+          />
+          {limits?.stale && limits.cachedAt ? (
+            <div className="stale-note">{fmtCachedAt(limits.cachedAt)}</div>
+          ) : null}
+        </div>
       </div>
 
       {/* Expandable details — always in DOM so CSS can animate height */}

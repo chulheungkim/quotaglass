@@ -2,21 +2,39 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+// ── drag state (shared between window events and commands) ───────────────────
+
+struct DragState {
+    // True while the user is holding & dragging the window. Set in begin_drag,
+    // cleared the instant the real left-mouse-button release is detected.
+    is_dragging: AtomicBool,
+    // True while the corner-snap animation is running, so background refreshes
+    // don't reposition the window mid-animation.
+    is_animating: AtomicBool,
+    // Guards against spawning more than one mouse-up watcher at a time.
+    drag_watching: AtomicBool,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 // ── Rate-limit usage structs (for /api/oauth/usage) ──────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct LimitWindow {
     utilization: Option<f64>,
@@ -29,6 +47,23 @@ pub struct RateLimits {
     five_hour: Option<LimitWindow>,
     seven_day: Option<LimitWindow>,
     seven_day_sonnet: Option<LimitWindow>,
+    // True when one or more windows came from the on-disk cache because the live
+    // API returned null/error — so the widget can always show last-known usage.
+    stale: bool,
+    // Epoch millis of the cached data when stale; None when fully live.
+    cached_at: Option<u64>,
+}
+
+// Last-known-good windows, persisted so usage is shown even when the live API
+// intermittently returns null windows (observed even with a valid token) or the
+// token has expired between Claude Code sessions.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CachedLimits {
+    five_hour: Option<LimitWindow>,
+    seven_day: Option<LimitWindow>,
+    seven_day_sonnet: Option<LimitWindow>,
+    saved_at: Option<u64>,
 }
 
 // ── Historical usage structs ──────────────────────────────────────────────────
@@ -334,9 +369,48 @@ fn read_oauth_token() -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn rate_cache_path() -> std::path::PathBuf {
+    app_support_dir().join("rate-limits-cache.json")
+}
+
+fn load_rate_cache() -> CachedLimits {
+    fs::read_to_string(rate_cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_rate_cache(c: &CachedLimits) {
+    let _ = fs::create_dir_all(app_support_dir());
+    if let Ok(s) = serde_json::to_string(c) {
+        let _ = fs::write(rate_cache_path(), s);
+    }
+}
+
+// Fall back to the last-known-good cache when the live fetch is unusable. Only
+// errors if we've never cached anything (so the UI shows a message, not blank).
+fn from_cache_or_err(cache: &CachedLimits, err: &str) -> Result<RateLimits, String> {
+    if cache.five_hour.is_some() || cache.seven_day.is_some() || cache.seven_day_sonnet.is_some() {
+        Ok(RateLimits {
+            five_hour: cache.five_hour.clone(),
+            seven_day: cache.seven_day.clone(),
+            seven_day_sonnet: cache.seven_day_sonnet.clone(),
+            stale: true,
+            cached_at: cache.saved_at,
+        })
+    } else {
+        Err(err.to_string())
+    }
+}
+
 #[tauri::command]
 fn get_rate_limits() -> Result<RateLimits, String> {
-    let token = read_oauth_token().ok_or_else(|| "No OAuth token found in keychain".to_string())?;
+    let cache = load_rate_cache();
+
+    let token = match read_oauth_token() {
+        Some(t) => t,
+        None => return from_cache_or_err(&cache, "No OAuth token found in keychain"),
+    };
 
     let out = Command::new("/usr/bin/curl")
         .args([
@@ -349,14 +423,31 @@ fn get_rate_limits() -> Result<RateLimits, String> {
             "anthropic-beta: oauth-2025-04-20",
             "https://api.anthropic.com/api/oauth/usage",
         ])
-        .output()
-        .map_err(|e| format!("curl error: {e}"))?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return from_cache_or_err(&cache, &format!("curl error: {e}")),
+    };
 
-    let body = String::from_utf8(out.stdout).map_err(|e| format!("UTF-8 error: {e}"))?;
-    let data: Value = serde_json::from_str(&body).map_err(|e| {
-        let preview = &body[..body.len().min(120)];
-        format!("JSON error: {e}: {preview}")
-    })?;
+    let body = match String::from_utf8(out.stdout) {
+        Ok(b) => b,
+        Err(e) => return from_cache_or_err(&cache, &format!("UTF-8 error: {e}")),
+    };
+    let data: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => return from_cache_or_err(&cache, &format!("JSON error: {e}")),
+    };
+
+    // An expired/invalid token returns {"type":"error","error":{...}} with no
+    // window keys — fall back to cached usage rather than blanking the panel.
+    if data.get("type").and_then(|v| v.as_str()) == Some("error") {
+        let msg = data
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Usage unavailable");
+        return from_cache_or_err(&cache, msg);
+    }
 
     let parse_window = |key: &str| -> Option<LimitWindow> {
         let w = data.get(key)?;
@@ -372,10 +463,36 @@ fn get_rate_limits() -> Result<RateLimits, String> {
         })
     };
 
+    let live_5 = parse_window("five_hour");
+    let live_7 = parse_window("seven_day");
+    let live_7s = parse_window("seven_day_sonnet");
+
+    // The API intermittently returns null windows even with a valid token. Keep
+    // the freshest known value per window so the widget always shows usage.
+    let five_hour = live_5.clone().or_else(|| cache.five_hour.clone());
+    let seven_day = live_7.clone().or_else(|| cache.seven_day.clone());
+    let seven_day_sonnet = live_7s.clone().or_else(|| cache.seven_day_sonnet.clone());
+
+    if live_5.is_some() || live_7.is_some() || live_7s.is_some() {
+        save_rate_cache(&CachedLimits {
+            five_hour: five_hour.clone(),
+            seven_day: seven_day.clone(),
+            seven_day_sonnet: seven_day_sonnet.clone(),
+            saved_at: Some(now_ms()),
+        });
+    }
+
+    // Stale if any returned window had to come from the cache this round.
+    let stale = (live_5.is_none() && five_hour.is_some())
+        || (live_7.is_none() && seven_day.is_some())
+        || (live_7s.is_none() && seven_day_sonnet.is_some());
+
     Ok(RateLimits {
-        five_hour: parse_window("five_hour"),
-        seven_day: parse_window("seven_day"),
-        seven_day_sonnet: parse_window("seven_day_sonnet"),
+        five_hour,
+        seven_day,
+        seven_day_sonnet,
+        stale,
+        cached_at: if stale { cache.saved_at } else { None },
     })
 }
 
@@ -400,37 +517,52 @@ fn save_corner(corner: &str) {
     let _ = fs::write(dir.join(".corner"), corner.as_bytes());
 }
 
+const CARD_WIDTH: f64 = 300.0;
+const MARGIN_SIDE: f64 = 10.0;
+const MARGIN_TOP: f64 = 44.0;
+const MARGIN_BOTTOM: f64 = 10.0;
+
+// Top-left target position for a given corner and *physical* window size.
+// Taking the size explicitly (rather than reading outer_size()) lets callers
+// position the window for a height it hasn't visually applied yet — essential
+// for anchoring a bottom corner while the height animates, so the bottom edge
+// stays put and the window grows upward.
+fn corner_xy(monitor: &tauri::Monitor, corner: &str, phys_w: i32, phys_h: i32) -> (i32, i32) {
+    let mp = monitor.position();
+    let ms = monitor.size();
+    let scale = monitor.scale_factor();
+    let mh = (MARGIN_SIDE * scale) as i32;
+    let mt = (MARGIN_TOP * scale) as i32;
+    let mb = (MARGIN_BOTTOM * scale) as i32;
+    let x = if corner.ends_with('l') {
+        mp.x + mh
+    } else {
+        (mp.x + ms.width as i32 - phys_w - mh).max(mp.x)
+    };
+    let y = if corner.starts_with('t') {
+        mp.y + mt
+    } else {
+        (mp.y + ms.height as i32 - phys_h - mb).max(mp.y)
+    };
+    (x, y)
+}
+
 fn position_at_corner(win: &tauri::WebviewWindow, corner: &str) {
     if let (Ok(Some(monitor)), Ok(wsize)) = (win.current_monitor(), win.outer_size()) {
-        let mp = monitor.position();
-        let ms = monitor.size();
-        let scale = monitor.scale_factor();
-        let mh = (10.0 * scale) as i32;
-        let mt = (44.0 * scale) as i32;
-        let mb = (10.0 * scale) as i32;
-
-        let x = if corner.ends_with('l') {
-            mp.x + mh
-        } else {
-            (mp.x + ms.width as i32 - wsize.width as i32 - mh).max(mp.x)
-        };
-        let y = if corner.starts_with('t') {
-            mp.y + mt
-        } else {
-            (mp.y + ms.height as i32 - wsize.height as i32 - mb).max(mp.y)
-        };
+        let (x, y) = corner_xy(&monitor, corner, wsize.width as i32, wsize.height as i32);
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
     }
 }
 
-fn snap_corner_impl(win: &tauri::WebviewWindow) {
+// Returns (corner, target_x, target_y) based on where the window center is.
+fn snap_target(win: &tauri::WebviewWindow) -> Option<(String, i32, i32)> {
     let (pos, wsize, monitor) = match (
         win.outer_position(),
         win.outer_size(),
         win.current_monitor(),
     ) {
         (Ok(p), Ok(ws), Ok(Some(m))) => (p, ws, m),
-        _ => return,
+        _ => return None,
     };
     let mp = monitor.position();
     let ms = monitor.size();
@@ -443,30 +575,122 @@ fn snap_corner_impl(win: &tauri::WebviewWindow) {
         if wcy < cy { 't' } else { 'b' },
         if wcx < cx { 'l' } else { 'r' }
     );
-    // Only move if it would actually change position to avoid event loops.
-    let scale = monitor.scale_factor();
-    let mh = (10.0 * scale) as i32;
-    let mt = (44.0 * scale) as i32;
-    let mb = (10.0 * scale) as i32;
-    let tx = if corner.ends_with('l') {
-        mp.x + mh
-    } else {
-        (mp.x + ms.width as i32 - wsize.width as i32 - mh).max(mp.x)
+    let (tx, ty) = corner_xy(&monitor, &corner, wsize.width as i32, wsize.height as i32);
+    Some((corner, tx, ty))
+}
+
+// Glide to the nearest corner with a time-based ease-out-quint animation.
+// Driving the position off elapsed time (not a fixed step count) keeps the
+// motion frame-accurate and buttery even if a frame is delayed; the quint curve
+// gives a gentle, soft landing. Aborts immediately if the user grabs the window
+// again, so a new drag never fights a still-running snap.
+fn snap_corner_impl(app: &tauri::AppHandle, win: &tauri::WebviewWindow) {
+    let (corner, tx, ty) = match snap_target(win) {
+        Some(v) => v,
+        None => return,
     };
-    let ty = if corner.starts_with('t') {
-        mp.y + mt
-    } else {
-        (mp.y + ms.height as i32 - wsize.height as i32 - mb).max(mp.y)
+    let start = match win.outer_position() {
+        Ok(p) => p,
+        Err(_) => return,
     };
-    if pos.x != tx || pos.y != ty {
-        let _ = win.set_position(tauri::PhysicalPosition::new(tx, ty));
-        save_corner(&corner);
+    save_corner(&corner);
+    if start.x == tx && start.y == ty {
+        return;
+    }
+    let win = win.clone();
+    let app = app.clone();
+    let sx = start.x as f32;
+    let sy = start.y as f32;
+    let dx = (tx - start.x) as f32;
+    let dy = (ty - start.y) as f32;
+    std::thread::spawn(move || {
+        let st = app.state::<DragState>();
+        st.is_animating.store(true, Ordering::Relaxed);
+        const DURATION: f32 = 0.42; // seconds
+        let begin = Instant::now();
+        loop {
+            if st.is_dragging.load(Ordering::Relaxed) {
+                break; // user grabbed it again — hand control back to the drag
+            }
+            let t = (begin.elapsed().as_secs_f32() / DURATION).min(1.0);
+            let e = 1.0 - (1.0 - t).powi(5); // ease-out quint — soft landing
+            let x = (sx + dx * e).round() as i32;
+            let y = (sy + dy * e).round() as i32;
+            let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+            if t >= 1.0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(8)); // ~120 fps
+        }
+        if !st.is_dragging.load(Ordering::Relaxed) {
+            let _ = win.set_position(tauri::PhysicalPosition::new(tx, ty));
+        }
+        st.is_animating.store(false, Ordering::Relaxed);
+    });
+}
+
+// True while the left mouse button is physically held down.
+#[cfg(target_os = "macos")]
+fn left_mouse_down() -> bool {
+    (objc2_app_kit::NSEvent::pressedMouseButtons() & 1) != 0
+}
+#[cfg(not(target_os = "macos"))]
+fn left_mouse_down() -> bool {
+    false
+}
+
+// Begin a window drag: marks the drag active and starts a watcher that fires the
+// corner snap the *instant* the real left-mouse-button release is detected. This
+// replaces Moved-gap debouncing, so slow and fast drags behave identically and
+// there is zero delay between releasing the mouse and the snap starting.
+#[tauri::command]
+fn begin_drag(window: tauri::WebviewWindow, state: tauri::State<DragState>) {
+    state.is_dragging.store(true, Ordering::Relaxed);
+    if state.drag_watching.swap(true, Ordering::Relaxed) {
+        return; // a watcher is already running
+    }
+    let app = window.app_handle().clone();
+    let win = window.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(8));
+            if !left_mouse_down() {
+                break;
+            }
+        }
+        let st = app.state::<DragState>();
+        st.is_dragging.store(false, Ordering::Relaxed);
+        st.drag_watching.store(false, Ordering::Relaxed);
+        snap_corner_impl(&app, &win);
+    });
+}
+
+// Resize and reanchor. Position is computed from the *target* height so a
+// bottom-anchored window grows upward correctly on every frame. Skipped while
+// dragging or snapping so background refreshes never fight those motions.
+#[tauri::command]
+fn set_height(window: tauri::WebviewWindow, state: tauri::State<DragState>, h: u32) {
+    if h == 0 {
+        return;
+    }
+    let _ = window.set_size(tauri::LogicalSize::new(CARD_WIDTH, h as f64));
+    if state.is_dragging.load(Ordering::Relaxed) || state.is_animating.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let scale = monitor.scale_factor();
+        let phys_w = (CARD_WIDTH * scale).round() as i32;
+        let phys_h = (h as f64 * scale).round() as i32;
+        let (x, y) = corner_xy(&monitor, &load_corner(), phys_w, phys_h);
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
     }
 }
 
 #[tauri::command]
-fn reanchor(window: tauri::WebviewWindow) {
-    position_at_corner(&window, &load_corner());
+fn reanchor(window: tauri::WebviewWindow, state: tauri::State<DragState>) {
+    if !state.is_dragging.load(Ordering::Relaxed) && !state.is_animating.load(Ordering::Relaxed) {
+        position_at_corner(&window, &load_corner());
+    }
 }
 
 // Native launch-at-login via SMAppService — the app registers itself as a
@@ -540,10 +764,29 @@ fn toggle_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(DragState {
+            is_dragging: AtomicBool::new(false),
+            is_animating: AtomicBool::new(false),
+            drag_watching: AtomicBool::new(false),
+        })
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() == ShortcutState::Pressed
+                        && shortcut
+                            == &Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyU)
+                    {
+                        toggle_window(app);
+                    }
+                })
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             get_usage_stats,
             get_rate_limits,
-            reanchor
+            begin_drag,
+            set_height,
+            reanchor,
         ])
         .on_window_event(|window, event| {
             // Closing hides the widget instead of quitting; it lives in the menu bar.
@@ -560,6 +803,14 @@ pub fn run() {
             // Register as a login item on first run of the installed (release) build.
             #[cfg(not(debug_assertions))]
             login_item::ensure_registered();
+
+            // Global show/hide hotkey: Cmd+Shift+U (U = Usage). Chosen to avoid
+            // common app/system bindings. Ignore errors so a conflicting binding
+            // never blocks startup.
+            let _ = app.global_shortcut().register(Shortcut::new(
+                Some(Modifiers::SUPER | Modifiers::SHIFT),
+                Code::KeyU,
+            ));
 
             // Menu-bar tray icon + menu.
             let toggle = MenuItemBuilder::with_id("toggle", "Show / Hide").build(app)?;
@@ -593,26 +844,10 @@ pub fn run() {
             let _tray = tray.build(app)?;
 
             if let Some(win) = app.get_webview_window("main") {
+                // Drag start is signalled from the frontend (begin_drag), and the
+                // snap fires on the real mouse-up — so no Moved-event listener or
+                // debounce is needed here. Just place the window initially.
                 position_at_corner(&win, &load_corner());
-
-                // Debounced corner-snap: after user stops dragging for 350 ms,
-                // snap to the nearest corner and persist the preference.
-                let snap_gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-                let snap_gen_ev = snap_gen.clone();
-                let win_ev = win.clone();
-                win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Moved(_) = event {
-                        let gen = snap_gen_ev.fetch_add(1, Ordering::SeqCst) + 1;
-                        let gen_task = snap_gen_ev.clone();
-                        let win_task = win_ev.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_millis(350));
-                            if gen_task.load(Ordering::SeqCst) == gen {
-                                snap_corner_impl(&win_task);
-                            }
-                        });
-                    }
-                });
             }
             Ok(())
         })

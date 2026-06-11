@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -22,3 +23,5 @@ serde_json = "1"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-service-management = { version = "0.3", features = ["SMAppService"] }
+# NSEvent::pressedMouseButtons — detect the real left-mouse-up to end a drag.
+objc2-app-kit = { version = "0.3", features = ["NSEvent"] }

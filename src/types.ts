@@ -35,4 +35,6 @@ export interface RateLimits {
   fiveHour: LimitWindow | null;
   sevenDay: LimitWindow | null;
   sevenDaySonnet: LimitWindow | null;
+  stale: boolean;
+  cachedAt: number | null;
 }
