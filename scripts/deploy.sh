@@ -6,11 +6,15 @@ INSTALL_DIR="$HOME/Applications"
 INSTALLED_APP="$INSTALL_DIR/$APP_NAME.app"
 BUILD_APP="$(dirname "$0")/../src-tauri/target/release/bundle/macos/$APP_NAME.app"
 
-# ── 1. Kill running instance ──────────────────────────────────────────────────
+# ── 1. Kill all running instances ────────────────────────────────────────────
 echo "→ Stopping $APP_NAME if running..."
-if pgrep -x "Claude Usage" > /dev/null 2>&1; then
-  pkill -x "Claude Usage"
-  sleep 1
+pkill -x "$APP_NAME" 2>/dev/null || true
+sleep 1
+
+# Remove stale copy from /Applications if present (prevents two instances)
+if [ -d "/Applications/$APP_NAME.app" ]; then
+  echo "→ Removing old /Applications/$APP_NAME.app..."
+  rm -rf "/Applications/$APP_NAME.app"
 fi
 
 # ── 2. Build ──────────────────────────────────────────────────────────────────
