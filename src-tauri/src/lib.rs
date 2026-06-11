@@ -14,6 +14,23 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
+// ── tray icon ────────────────────────────────────────────────────────────────
+
+fn make_tray_icon() -> tauri::image::Image<'static> {
+    const SIZE: u32 = 32;
+    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let (cx, cy, r) = (SIZE as i32 / 2, SIZE as i32 / 2, 11i32);
+    for y in 0..SIZE as i32 {
+        for x in 0..SIZE as i32 {
+            if (x - cx).pow(2) + (y - cy).pow(2) <= r * r {
+                let i = ((y * SIZE as i32 + x) * 4) as usize;
+                rgba[i + 3] = 255; // black (R/G/B stay 0), fully opaque
+            }
+        }
+    }
+    tauri::image::Image::new_owned(rgba, SIZE, SIZE)
+}
+
 // ── drag state (shared between window events and commands) ───────────────────
 
 // Keeps the FSEvents watcher alive for the app's lifetime.
@@ -860,9 +877,12 @@ pub fn run() {
                     }
                     _ => {}
                 });
-            if let Some(icon) = app.default_window_icon().cloned() {
-                tray = tray.icon(icon);
-            }
+            // Dedicated 32×32 template icon keeps the menu-bar item at the
+            // standard 16pt height. icon_as_template lets macOS invert it for
+            // light/dark mode automatically.
+            tray = tray
+                .icon(make_tray_icon())
+                .icon_as_template(true);
             let _tray = tray.build(app)?;
 
             if let Some(win) = app.get_webview_window("main") {
