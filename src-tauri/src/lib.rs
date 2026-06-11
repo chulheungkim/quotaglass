@@ -16,19 +16,14 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 // ── tray icon ────────────────────────────────────────────────────────────────
 
+mod tray_icon;
+
 fn make_tray_icon() -> tauri::image::Image<'static> {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
-    let (cx, cy, r) = (SIZE as i32 / 2, SIZE as i32 / 2, 11i32);
-    for y in 0..SIZE as i32 {
-        for x in 0..SIZE as i32 {
-            if (x - cx).pow(2) + (y - cy).pow(2) <= r * r {
-                let i = ((y * SIZE as i32 + x) * 4) as usize;
-                rgba[i + 3] = 255; // black (R/G/B stay 0), fully opaque
-            }
-        }
-    }
-    tauri::image::Image::new_owned(rgba, SIZE, SIZE)
+    tauri::image::Image::new(
+        tray_icon::TRAY_ICON_RGBA,
+        tray_icon::TRAY_ICON_SIZE,
+        tray_icon::TRAY_ICON_SIZE,
+    )
 }
 
 // ── drag state (shared between window events and commands) ───────────────────
