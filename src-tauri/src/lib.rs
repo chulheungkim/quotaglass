@@ -5,14 +5,20 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use notify::{RecursiveMode, Watcher};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 // ── drag state (shared between window events and commands) ───────────────────
+
+// Keeps the FSEvents watcher alive for the app's lifetime.
+#[allow(dead_code)]
+struct FsWatcher(std::sync::Mutex<notify::RecommendedWatcher>);
 
 struct DragState {
     // True while the user is holding & dragging the window. Set in begin_drag,
@@ -204,8 +210,16 @@ fn process_file(
     }
 }
 
+// Async wrapper: the heavy JSONL scan is offloaded to the blocking thread pool
+// so it never stalls the main UI thread (which would trigger the macOS beachball).
 #[tauri::command]
-fn get_usage_stats() -> Result<UsageStats, String> {
+async fn get_usage_stats() -> Result<UsageStats, String> {
+    tauri::async_runtime::spawn_blocking(get_usage_stats_impl)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_usage_stats_impl() -> Result<UsageStats, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
     let cache_path = format!("{home}/.claude/stats-cache.json");
     let projects_dir = format!("{home}/.claude/projects");
@@ -403,8 +417,16 @@ fn from_cache_or_err(cache: &CachedLimits, err: &str) -> Result<RateLimits, Stri
     }
 }
 
+// Async wrapper: the network curl (up to 8 s) and keychain read run on the
+// blocking thread pool, keeping the main thread responsive during refreshes.
 #[tauri::command]
-fn get_rate_limits() -> Result<RateLimits, String> {
+async fn get_rate_limits() -> Result<RateLimits, String> {
+    tauri::async_runtime::spawn_blocking(get_rate_limits_impl)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn get_rate_limits_impl() -> Result<RateLimits, String> {
     let cache = load_rate_cache();
 
     let token = match read_oauth_token() {
@@ -844,11 +866,62 @@ pub fn run() {
             let _tray = tray.build(app)?;
 
             if let Some(win) = app.get_webview_window("main") {
-                // Drag start is signalled from the frontend (begin_drag), and the
-                // snap fires on the real mouse-up — so no Moved-event listener or
-                // debounce is needed here. Just place the window initially.
                 position_at_corner(&win, &load_corner());
             }
+
+            // Watch ~/.claude/projects/ for JSONL writes; emit "usage-updated"
+            // to the frontend with a 1.5s debounce so rapid session writes
+            // coalesce into a single refresh rather than hammering get_usage_stats.
+            if let Ok(home) = std::env::var("HOME") {
+                let projects_path = std::path::PathBuf::from(&home)
+                    .join(".claude")
+                    .join("projects");
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                let app_h = app.handle().clone();
+
+                let watcher_result =
+                    notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                        if let Ok(event) = res {
+                            let has_jsonl = event
+                                .paths
+                                .iter()
+                                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"));
+                            if has_jsonl {
+                                let _ = tx.send(());
+                            }
+                        }
+                    });
+
+                if let Ok(mut watcher) = watcher_result {
+                    if watcher
+                        .watch(&projects_path, RecursiveMode::Recursive)
+                        .is_ok()
+                    {
+                        // Debounce: emit only after 1.5 s of silence.
+                        std::thread::spawn(move || {
+                            let mut last: Option<Instant> = None;
+                            loop {
+                                match rx.recv_timeout(Duration::from_millis(100)) {
+                                    Ok(()) => {
+                                        last = Some(Instant::now());
+                                    }
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                        if let Some(t) = last {
+                                            if t.elapsed() >= Duration::from_millis(1500) {
+                                                let _ = app_h.emit("usage-updated", ());
+                                                last = None;
+                                            }
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                        app.manage(FsWatcher(std::sync::Mutex::new(watcher)));
+                    }
+                }
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())

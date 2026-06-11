@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ChevronDown, Minimize2, Maximize2 } from "lucide-react";
+import { ChevronDown, Minimize2, Maximize2, RefreshCw } from "lucide-react";
 import type { UsageStats, RateLimits, LimitWindow } from "./types";
 
 // ── model display helpers ─────────────────────────────────────────────────────
@@ -55,15 +56,16 @@ function mmdd(s: string): string {
   return p.length === 3 ? `${p[1]}/${p[2]}` : s;
 }
 
-function fmtCachedAt(ms: number): string {
-  const t = new Date(ms)
-    .toLocaleTimeString("en-US", {
-      hour: "numeric",
+// 24-hour KST timestamp, e.g. "14:32:05 KST"
+function fmtKST(ms: number): string {
+  return (
+    new Date(ms).toLocaleTimeString("en-GB", {
+      hour: "2-digit",
       minute: "2-digit",
-      hour12: true,
-    })
-    .replace(/ ([AP]M)/i, (_, m: string) => m.toLowerCase());
-  return `Last updated ${t}`;
+      second: "2-digit",
+      timeZone: "Asia/Seoul",
+    }) + " KST"
+  );
 }
 
 // Matches Claude Code's own isQ() / WGA() formatter
@@ -123,8 +125,6 @@ function UsageBar({
   title: string;
   window: LimitWindow | null;
 }) {
-  // Always render the bar — a null window (no data yet for this period) shows
-  // 0% rather than disappearing, so the panel is never blank.
   const pct = w?.utilization ?? 0;
   const resetStr = w?.resetsAt ? formatReset(w.resetsAt) : null;
 
@@ -159,7 +159,17 @@ export default function App() {
   const [ultra, setUltra] = useState(
     () => localStorage.getItem("widget-ultra") === "1",
   );
+  // Per-source loading flags — drives button spin and bar dim independently.
+  const [loadingLimits, setLoadingLimits] = useState(false);
+  const [loadingStats, setLoadingStats] = useState(false);
+  // "Refreshed HH:MM:SS KST" appears for 3.5 s after any limits fetch then fades.
+  // Always in DOM to avoid layout shift; visibility controlled by opacity.
+  const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
+  const [refreshedVisible, setRefreshedVisible] = useState(false);
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const cardRef = useRef<HTMLDivElement>(null);
+
+  const isRefreshing = loadingLimits || loadingStats;
 
   const toggleUltra = () =>
     setUltra((u) => {
@@ -168,59 +178,81 @@ export default function App() {
       return next;
     });
 
-  // Grab anywhere: pressing on the card body starts a native window drag,
-  // except on interactive controls (the header buttons) which need their click.
-  // begin_drag arms the native mouse-up watcher that fires the corner snap the
-  // moment the button is released.
-  const onCardMouseDown = (e: ReactMouseEvent) => {
-    if (e.button !== 0) return; // primary button only
-    if (e.target instanceof Element && e.target.closest("button")) return;
-    invoke("begin_drag").catch(() => undefined);
+  // ── data loaders ─────────────────────────────────────────────────────────────
+
+  const loadLimits = useCallback(async () => {
+    setLoadingLimits(true);
+    try {
+      const data = await invoke<RateLimits>("get_rate_limits");
+      setLimits(data);
+      setLimitsErr(null);
+      // Show the "Refreshed" timestamp, then fade it out after 3.5 s.
+      setRefreshedAt(Date.now());
+      setRefreshedVisible(true);
+      clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = setTimeout(() => setRefreshedVisible(false), 3500);
+    } catch (e) {
+      setLimitsErr(String(e));
+    } finally {
+      setLoadingLimits(false);
+    }
+  }, []);
+
+  const loadStats = useCallback(async () => {
+    setLoadingStats(true);
+    try {
+      const data = await invoke<UsageStats>("get_usage_stats");
+      setStats(data);
+    } catch {
+      /* ignore */
+    } finally {
+      setLoadingStats(false);
+    }
+  }, []);
+
+  // Rate limits — network call every 5 min, plus on-demand triggers
+  useEffect(() => {
+    loadLimits();
+    const id = setInterval(loadLimits, 300_000);
+    return () => clearInterval(id);
+  }, [loadLimits]);
+
+  // Historical stats — local reads every 60 s (fallback; file watcher is primary)
+  useEffect(() => {
+    loadStats();
+    const id = setInterval(loadStats, 60_000);
+    return () => clearInterval(id);
+  }, [loadStats]);
+
+  // File watcher: Rust emits "usage-updated" when JSONL files change
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen("usage-updated", () => loadStats()).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, [loadStats]);
+
+  // Refresh both on window focus (widget shown after being hidden)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
     getCurrentWindow()
-      .startDragging()
-      .catch(() => undefined);
-  };
-
-  // Rate limits — network call every 5 min
-  useEffect(() => {
-    let active = true;
-    const load = async () => {
-      try {
-        const data = await invoke<RateLimits>("get_rate_limits");
-        if (active) {
-          setLimits(data);
-          setLimitsErr(null);
+      .onFocusChanged(({ payload: focused }) => {
+        if (focused) {
+          loadStats();
+          loadLimits();
         }
-      } catch (e) {
-        if (active) setLimitsErr(String(e));
-      }
-    };
-    load();
-    const id = setInterval(load, 300_000);
-    return () => {
-      active = false;
-      clearInterval(id);
-    };
-  }, []);
+      })
+      .then((fn) => {
+        unlisten = fn;
+      });
+    return () => unlisten?.();
+  }, [loadStats, loadLimits]);
 
-  // Historical stats — local reads every 60 s (always, so expand is instant)
-  useEffect(() => {
-    let active = true;
-    const load = async () => {
-      try {
-        const data = await invoke<UsageStats>("get_usage_stats");
-        if (active) setStats(data);
-      } catch {
-        /* ignore */
-      }
-    };
-    load();
-    const id = setInterval(load, 60_000);
-    return () => {
-      active = false;
-      clearInterval(id);
-    };
-  }, []);
+  // Clean up the hide-timer on unmount (defensive)
+  useEffect(() => () => clearTimeout(hideTimerRef.current), []);
+
+  // ── window sizing ─────────────────────────────────────────────────────────────
 
   // Resize + reanchor when data arrives. set_height is atomic and skips
   // repositioning while the user is dragging, so no mid-drag teleport.
@@ -231,9 +263,10 @@ export default function App() {
     if (h > 0) invoke("set_height", { h }).catch(() => undefined);
   }, [limits, limitsErr, stats]);
 
-  // RAF-tracked resize during animated transitions. Calls set_height every
-  // frame so bottom-corner widgets grow upward correctly throughout the
-  // animation, not just at the end.
+  // RAF-tracked resize during animated transitions. Runs for mode switches
+  // (expanded/ultra) and for the refreshed-stamp show/hide, so the window grows
+  // and shrinks in lockstep with the stamp's grid-collapse animation rather than
+  // clipping it or leaving a gap.
   useEffect(() => {
     let raf: number;
     const deadline = Date.now() + 650;
@@ -253,7 +286,25 @@ export default function App() {
     };
     raf = requestAnimationFrame(poll);
     return () => cancelAnimationFrame(raf);
-  }, [expanded, ultra]);
+  }, [expanded, ultra, refreshedVisible]);
+
+  // ── drag ─────────────────────────────────────────────────────────────────────
+
+  const onCardMouseDown = (e: ReactMouseEvent) => {
+    if (e.button !== 0) return;
+    if (e.target instanceof Element && e.target.closest("button")) return;
+    invoke("begin_drag").catch(() => undefined);
+    getCurrentWindow()
+      .startDragging()
+      .catch(() => undefined);
+  };
+
+  const handleRefresh = async () => {
+    if (isRefreshing) return;
+    await Promise.all([loadStats(), loadLimits()]);
+  };
+
+  // ── derived display data ──────────────────────────────────────────────────────
 
   const tokenRows = stats
     ? Object.entries(stats.modelTokens)
@@ -274,6 +325,8 @@ export default function App() {
     days.length * barW + Math.max(0, days.length - 1) * gap,
   );
 
+  // ── render ────────────────────────────────────────────────────────────────────
+
   return (
     <div className="card" ref={cardRef} onMouseDown={onCardMouseDown}>
       {/* Header */}
@@ -285,7 +338,18 @@ export default function App() {
           </span>
         </div>
         <div className="header-btns">
-          {/* Ultra-compact toggle: 2 lines = compress, 3 lines = expand */}
+          <button
+            className="header-btn"
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            title="Refresh"
+          >
+            <RefreshCw
+              size={11}
+              className={isRefreshing ? "spinning" : undefined}
+            />
+          </button>
+          {/* Ultra-compact toggle */}
           <button
             className="header-btn"
             onClick={toggleUltra}
@@ -308,7 +372,9 @@ export default function App() {
 
       {/* Ultra-compact: 3 visual-only bars, no labels */}
       <div className={`mode-panel ultra-panel${ultra ? " visible" : ""}`}>
-        <div className="mode-panel-inner">
+        <div
+          className={`mode-panel-inner${loadingLimits ? " refreshing" : ""}`}
+        >
           <div className="ultra-bars">
             {[limits?.fiveHour, limits?.sevenDay, limits?.sevenDaySonnet].map(
               (w, i) => {
@@ -333,10 +399,11 @@ export default function App() {
         </div>
       </div>
 
-      {/* Normal compact: rate-limit bars with labels. Bars always render so
-          the panel is never blank — an error or loading note sits above them. */}
+      {/* Normal compact: rate-limit bars with labels. */}
       <div className={`mode-panel normal-panel${ultra ? "" : " visible"}`}>
-        <div className="mode-panel-inner">
+        <div
+          className={`mode-panel-inner${loadingLimits ? " refreshing" : ""}`}
+        >
           {limitsErr ? (
             <div className="empty limits-err">{limitsErr}</div>
           ) : !limits ? (
@@ -351,9 +418,16 @@ export default function App() {
             title="Current week (Sonnet only)"
             window={limits?.sevenDaySonnet ?? null}
           />
-          {limits?.stale && limits.cachedAt ? (
-            <div className="stale-note">{fmtCachedAt(limits.cachedAt)}</div>
-          ) : null}
+          {/* Collapses to zero height when hidden — no empty space reservation */}
+          <div
+            className={`refreshed-wrapper${refreshedVisible ? " visible" : ""}`}
+          >
+            <div className="refreshed-inner">
+              <div className="refreshed-at">
+                {refreshedAt !== null ? `Refreshed ${fmtKST(refreshedAt)}` : ""}
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -365,7 +439,7 @@ export default function App() {
           {stats ? (
             <>
               {/* Today quick stats */}
-              <div className="stats">
+              <div className={`stats${loadingStats ? " refreshing" : ""}`}>
                 <div className="stat">
                   <div className="stat-value">
                     {compact(stats.today.messages)}
