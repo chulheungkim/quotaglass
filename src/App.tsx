@@ -166,7 +166,9 @@ export default function App() {
   // Always in DOM to avoid layout shift; visibility controlled by opacity.
   const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
   const [refreshedVisible, setRefreshedVisible] = useState(false);
-  const hideTimerRef = useRef<ReturnType<typeof setTimeout>>();
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   const cardRef = useRef<HTMLDivElement>(null);
 
   const isRefreshing = loadingLimits || loadingStats;
