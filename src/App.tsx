@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -168,6 +174,12 @@ export default function App() {
   const [refreshedVisible, setRefreshedVisible] = useState(false);
   const providerRef = useRef(provider);
   const cardRef = useRef<HTMLDivElement>(null);
+  const providerHeightAnimationRef = useRef<Animation | null>(null);
+  const providerHeightFromRef = useRef<number | null>(null);
+  const providerHeightMotionRef = useRef(false);
+  const providerHeightMotionTimerRef = useRef<
+    ReturnType<typeof setTimeout> | undefined
+  >(undefined);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -176,6 +188,15 @@ export default function App() {
   const isDetailed = view === "detailed";
 
   const selectProvider = useCallback((next: ProviderId) => {
+    const currentHeight = cardRef.current?.getBoundingClientRect().height;
+    if (currentHeight && currentHeight > 0) {
+      providerHeightFromRef.current = currentHeight;
+      providerHeightMotionRef.current = true;
+      clearTimeout(providerHeightMotionTimerRef.current);
+      providerHeightMotionTimerRef.current = setTimeout(() => {
+        providerHeightMotionRef.current = false;
+      }, 15_000);
+    }
     providerRef.current = next;
     saveProvider(next);
     setProvider(next);
@@ -281,7 +302,71 @@ export default function App() {
     return () => unlisten?.();
   }, [loadLimits, loadStats]);
 
-  useEffect(() => () => clearTimeout(hideTimerRef.current), []);
+  useEffect(
+    () => () => {
+      clearTimeout(hideTimerRef.current);
+      clearTimeout(providerHeightMotionTimerRef.current);
+      providerHeightAnimationRef.current?.cancel();
+    },
+    [],
+  );
+
+  useLayoutEffect(() => {
+    if (!providerHeightMotionRef.current) return;
+    const card = cardRef.current;
+    if (!card) return;
+
+    const runningAnimation = providerHeightAnimationRef.current;
+    const currentHeight =
+      providerHeightFromRef.current ?? card.getBoundingClientRect().height;
+    providerHeightFromRef.current = null;
+
+    runningAnimation?.cancel();
+    providerHeightAnimationRef.current = null;
+    const targetHeight = Math.ceil(card.getBoundingClientRect().height);
+
+    if (
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
+      Math.abs(targetHeight - currentHeight) < 1
+    ) {
+      card.classList.remove("provider-height-motion");
+      return;
+    }
+
+    card.classList.add("provider-height-motion");
+    const animation = card.animate(
+      [{ height: `${currentHeight}px` }, { height: `${targetHeight}px` }],
+      {
+        duration: 420,
+        easing: "cubic-bezier(0.33, 0, 0.2, 1)",
+        fill: "both",
+      },
+    );
+    providerHeightAnimationRef.current = animation;
+    void animation.finished
+      .then(() => {
+        if (providerHeightAnimationRef.current !== animation) return;
+        animation.cancel();
+        providerHeightAnimationRef.current = null;
+        card.classList.remove("provider-height-motion");
+      })
+      .catch(() => undefined);
+  }, [provider, limits, limitsErr, stats]);
+
+  useEffect(() => {
+    if (
+      !providerHeightMotionRef.current ||
+      loadingLimits ||
+      loadingStats ||
+      (!limits && !limitsErr)
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      providerHeightMotionRef.current = false;
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [limits, limitsErr, loadingLimits, loadingStats, stats]);
 
   useEffect(() => {
     const element = cardRef.current;
@@ -307,7 +392,7 @@ export default function App() {
     };
     animationFrame = requestAnimationFrame(poll);
     return () => cancelAnimationFrame(animationFrame);
-  }, [view, refreshedVisible]);
+  }, [view, refreshedVisible, provider, limits, limitsErr, stats]);
 
   const onCardMouseDown = (event: ReactMouseEvent) => {
     if (event.button !== 0) return;
@@ -350,7 +435,7 @@ export default function App() {
         </div>
         <div className="header-btns">
           <button
-            className="header-btn provider-switch-btn"
+            className="header-btn"
             onClick={() => selectProvider(nextProvider(provider))}
             title={`Switch to ${provider === "claude" ? "Codex" : "Claude Code"} (⌃⌥P)`}
             aria-label={`Switch to ${provider === "claude" ? "Codex" : "Claude Code"}`}

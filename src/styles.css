@@ -38,6 +38,10 @@ body {
   color: #ededf2;
 }
 
+.card.provider-height-motion {
+  overflow: hidden;
+}
+
 /* ── header ── */
 
 .header {
@@ -89,17 +93,6 @@ body {
 .header-btn:hover,
 .expand-btn:hover {
   color: #ededf2;
-}
-
-.provider-switch-btn {
-  color: #88889d;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.provider-switch-btn:hover {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.14);
 }
 
 /* ── mode switch animation (ultra ↔ default) ── */

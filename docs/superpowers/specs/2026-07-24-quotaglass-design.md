@@ -178,9 +178,12 @@ prevents invalid combinations.
 ### Provider switching
 
 - `Control+Option+P` cycles Claude and Codex globally.
-- A distinct switch button in the widget header performs the same action.
+- A distinct switch button in the widget header performs the same action and
+  uses the shared header-button styling.
 - The selected provider persists across launches.
 - Switching triggers an immediate provider-specific refresh.
+- The widget height transitions smoothly when the provider contents have
+  different intrinsic heights.
 - A hidden widget remains hidden; `Cmd+Shift+U` remains the explicit Show/Hide
   shortcut.
 
