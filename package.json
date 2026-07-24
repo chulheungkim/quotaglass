@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "icon": "node scripts/make-icon.cjs && tauri icon icon-source.png",
     "preview": "vite preview",
     "tauri": "tauri",
     "ship": "bash scripts/deploy.sh"
