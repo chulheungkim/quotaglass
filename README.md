@@ -1,90 +1,113 @@
-# QuotaGlass
+<p align="center">
+  <img src="assets/brand/quotaglass-meter-pane-master.png" width="180" alt="QuotaGlass logo">
+</p>
 
-QuotaGlass is a frameless, always-on-top macOS menu-bar widget for monitoring
-AI agent usage. It currently supports Claude Code and Codex while keeping the
-provider boundary open for future agents.
+<h1 align="center">QuotaGlass</h1>
 
-**AI agent usage at a glance.**
+<p align="center">
+  AI agent usage at a glance.
+</p>
 
-The widget shows live quota windows in compact views and adds daily activity,
-local sessions, tool calls, and per-model output tokens in its detailed view.
-It is built with Tauri 2, React, and TypeScript.
+<p align="center">
+  A quiet, always-available macOS widget for monitoring Claude Code and Codex
+  usage without leaving your workflow.
+</p>
 
-## Shortcuts
+## What is QuotaGlass?
 
-The shortcuts are macOS-wide while QuotaGlass is running and are unregistered
-when it quits:
+QuotaGlass lives in the macOS menu bar and keeps the usage limits that matter
+close at hand. Its provider-neutral foundation presents Claude Code and Codex
+through one consistent interface, with room for more agents over time.
 
-- `Control+Option+P` — switch provider
-- `Control+Option+V` — cycle super compact, compact, and detailed views
-- `Command+Shift+U` — show or hide QuotaGlass
+- Switch between Claude Code and Codex from the widget or a global shortcut.
+- Move between super compact, compact, and detailed views.
+- See live quota windows, reset times, and last-known-good data.
+- Inspect local activity, sessions, tool calls, and model output in the
+  detailed view.
+- Keep it out of the way with no Dock icon or Cmd+Tab entry.
+- Snap the widget to any display corner and restore its position on launch.
 
-The provider name in the header is also clickable.
+## Global shortcuts
 
-## Data sources
+Shortcuts remain available across macOS while QuotaGlass is running and are
+unregistered when the app quits.
+
+| Action                  | Shortcut                   |
+| ----------------------- | -------------------------- |
+| Switch provider         | `Control+Option+P` (`⌃⌥P`) |
+| Cycle view              | `Control+Option+V` (`⌃⌥V`) |
+| Show or hide QuotaGlass | `Command+Shift+U` (`⇧⌘U`)  |
+
+The provider name and view controls in the widget remain clickable too.
+
+## Data and privacy
+
+QuotaGlass talks directly to the tools already authenticated on your Mac.
 
 ### Claude Code
 
-- Reads the local Claude stats cache and session JSONL files.
+- Reads Claude Code's local stats cache and session JSONL files.
 - Fetches quota windows from Anthropic's OAuth usage endpoint using the Claude
   Code credential stored in macOS Keychain.
 
 ### Codex
 
-- Keeps one local `codex app-server` process and uses the stable
+- Maintains one local `codex app-server` process and calls its stable
   `account/rateLimits/read` and `account/usage/read` methods.
-- Reads local Codex session JSONL files for metadata-only details: prompt,
-  session, and tool counts plus output tokens by model.
+- Reads local Codex session JSONL files for metadata-only details such as
+  prompt, session, tool, and output-token counts.
 - Never reads or stores prompt text, response text, or Codex authentication
   files.
 
-Both providers retain last-known-good quota data so transient network or
-account errors do not immediately blank the widget.
+Both providers retain last-known-good quota data so a transient account or
+network error does not immediately blank the widget.
 
-## Behavior
-
-- Runs as an `LSUIElement` background agent: no Dock icon and no Cmd+Tab entry.
-- Provides Show / Hide, Start at Login, and Quit in the menu-bar tray.
-- Closing the window hides it rather than quitting.
-- Auto-sizes, snaps to the nearest display corner, and remembers that corner.
-- Registers with `SMAppService` on the first installed release launch.
-- Migrates state from the previous Claude Usage bundle identifier on first run.
-
-## Prerequisites
+## Requirements
 
 - macOS 13 or newer
-- Node.js and pnpm
-- Rust toolchain
-- Claude Code and/or Codex authenticated locally for the corresponding provider
+- Claude Code and/or Codex authenticated locally
+- Node.js, pnpm, and the Rust toolchain for development
 
-## Develop
+## Development
+
+Install dependencies and start the Tauri development app:
 
 ```bash
 pnpm install
 pnpm tauri dev
 ```
 
-## Build and install
+Run the frontend build and Rust tests:
+
+```bash
+pnpm build
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+Build, install, and relaunch the app at `~/Applications/QuotaGlass.app`:
 
 ```bash
 pnpm ship
 ```
 
-This builds the release app, installs it at
-`~/Applications/QuotaGlass.app`, removes the previous user-local
-`Claude Usage.app`, and launches QuotaGlass.
-
-To build only:
+To build the macOS app bundle without installing it:
 
 ```bash
 pnpm tauri build --bundles app
 ```
 
-## Project layout
+## Project structure
 
-- `src/` — provider-neutral React UI, persistent provider/view state, assets
+- `src/` — provider-neutral React UI and persisted provider/view state
 - `src-tauri/src/providers/` — provider integrations and shared response types
 - `src-tauri/src/codex_rpc.rs` — persistent Codex app-server JSON-RPC client
-- `src-tauri/src/lib.rs` — Claude adapter, Tauri commands, shortcuts, tray,
-  window placement, session watchers, and login item
+- `src-tauri/src/lib.rs` — Tauri commands, shortcuts, tray, placement,
+  filesystem watchers, and login item
+- `assets/brand/` — approved QuotaGlass app and menu-bar brand assets
 - `scripts/deploy.sh` — one-step build, install, and relaunch
+
+## Contributing
+
+Issues and pull requests are welcome. Please keep provider-specific behavior
+behind the normalized provider boundary and preserve the lightweight,
+glanceable character of the widget.
