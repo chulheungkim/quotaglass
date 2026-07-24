@@ -1,74 +1,113 @@
-# Claude Usage Widget
+<p align="center">
+  <img src="assets/brand/quotaglass-meter-pane-master.png" width="180" alt="QuotaGlass logo">
+</p>
 
-A frameless, always-on-top macOS **menu-bar widget** showing live Claude Code
-usage — today's messages/sessions/tools, a 14-day activity sparkline, and an
-all-time token breakdown by model. Built with Tauri 2 + React + TypeScript.
+<h1 align="center">QuotaGlass</h1>
 
-The Rust backend reads `~/.claude/stats-cache.json` and scans session JSONL
-files directly, so the app is fully self-contained — no Node runtime, no shell
-scripts, no external data process.
+<p align="center">
+  AI agent usage at a glance.
+</p>
 
-## Behavior
+<p align="center">
+  A quiet, always-available macOS widget for monitoring Claude Code and Codex
+  usage without leaving your workflow.
+</p>
 
-- **Background agent** (`LSUIElement`): no Dock icon, not in Cmd+Tab. Lives in
-  the menu bar via a tray icon.
-- **Tray menu**: *Show / Hide*, *Start at Login* (synced), *Quit*.
-- Closing the window **hides** it to the menu bar instead of quitting.
-- **Launch at login** via `SMAppService` (macOS 13+): the app registers itself
-  as a login item on first run, so it appears under *System Settings → Login
-  Items → Open at Login* with its real icon and a toggle that stays in sync with
-  the tray. Auto-registration happens only once (a marker file at
-  `~/Library/Application Support/com.chulheong.claudeusage/.login-registered`),
-  so disabling it later is respected.
-- Window auto-sizes to its content, anchors top-right of the primary display,
-  and is draggable anywhere on the card.
-- Stats refresh every 60 seconds. Dates are bucketed in UTC to match Claude
-  Code's own stats cache.
+## What is QuotaGlass?
 
-## Prerequisites
+QuotaGlass lives in the macOS menu bar and keeps the usage limits that matter
+close at hand. Its provider-neutral foundation presents Claude Code and Codex
+through one consistent interface, with room for more agents over time.
 
-- Node + pnpm
-- Rust toolchain:
-  ```
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-  source "$HOME/.cargo/env"
-  ```
+- Switch between Claude Code and Codex from the widget or a global shortcut.
+- Move between super compact, compact, and detailed views.
+- See live quota windows, reset times, and last-known-good data.
+- Inspect local activity, sessions, tool calls, and model output in the
+  detailed view.
+- Keep it out of the way with no Dock icon or Cmd+Tab entry.
+- Snap the widget to any display corner and restore its position on launch.
 
-## Develop
+## Global shortcuts
 
-```
+Shortcuts remain available across macOS while QuotaGlass is running and are
+unregistered when the app quits.
+
+| Action                  | Shortcut                   |
+| ----------------------- | -------------------------- |
+| Switch provider         | `Control+Option+P` (`⌃⌥P`) |
+| Cycle view              | `Control+Option+V` (`⌃⌥V`) |
+| Show or hide QuotaGlass | `Command+Shift+U` (`⇧⌘U`)  |
+
+The provider name and view controls in the widget remain clickable too.
+
+## Data and privacy
+
+QuotaGlass talks directly to the tools already authenticated on your Mac.
+
+### Claude Code
+
+- Reads Claude Code's local stats cache and session JSONL files.
+- Fetches quota windows from Anthropic's OAuth usage endpoint using the Claude
+  Code credential stored in macOS Keychain.
+
+### Codex
+
+- Maintains one local `codex app-server` process and calls its stable
+  `account/rateLimits/read` and `account/usage/read` methods.
+- Reads local Codex session JSONL files for metadata-only details such as
+  prompt, session, tool, and output-token counts.
+- Never reads or stores prompt text, response text, or Codex authentication
+  files.
+
+Both providers retain last-known-good quota data so a transient account or
+network error does not immediately blank the widget.
+
+## Requirements
+
+- macOS 13 or newer
+- Claude Code and/or Codex authenticated locally
+- Node.js, pnpm, and the Rust toolchain for development
+
+## Development
+
+Install dependencies and start the Tauri development app:
+
+```bash
 pnpm install
 pnpm tauri dev
 ```
 
-In dev, login-at-launch auto-registration is disabled (it only runs in release
-builds), so testing never touches your real Login Items.
+Run the frontend build and Rust tests:
 
-## Build & install
-
+```bash
+pnpm build
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+Build, install, and relaunch the app at `~/Applications/QuotaGlass.app`:
+
+```bash
+pnpm ship
+```
+
+To build the macOS app bundle without installing it:
+
+```bash
 pnpm tauri build --bundles app
-
-# Install to the per-user Applications folder (preserves the code signature):
-ditto "src-tauri/target/release/bundle/macos/Claude Usage.app" \
-      ~/Applications/"Claude Usage.app"
-
-# Re-sign ad-hoc so the signature is self-consistent:
-codesign --force --deep --sign - ~/Applications/"Claude Usage.app"
-
-open ~/Applications/"Claude Usage.app"
 ```
 
-The first launch registers the app as a login item automatically.
+## Project structure
 
-## Project layout
+- `src/` — provider-neutral React UI and persisted provider/view state
+- `src-tauri/src/providers/` — provider integrations and shared response types
+- `src-tauri/src/codex_rpc.rs` — persistent Codex app-server JSON-RPC client
+- `src-tauri/src/lib.rs` — Tauri commands, shortcuts, tray, placement,
+  filesystem watchers, and login item
+- `assets/brand/` — approved QuotaGlass app and menu-bar brand assets
+- `scripts/deploy.sh` — one-step build, install, and relaunch
 
-- `src/` — React + TypeScript frontend (Vite)
-  - `App.tsx` — widget UI: stats, sparkline (inline SVG), token bars
-  - `types.ts` — `UsageStats` shape mirroring the Rust command output
-- `src-tauri/src/lib.rs`
-  - `get_usage_stats` — reads the stats cache + session JSONLs, merges, returns stats
-  - `login_item` — `SMAppService` registration (login-at-launch)
-  - tray icon, window positioning, close-to-hide, agent activation policy
-- `src-tauri/Info.plist` — `LSUIElement` (background agent)
-- `scripts/make-icon.cjs` — regenerates the source icon (`pnpm tauri icon icon-source.png`)
+## Contributing
+
+Issues and pull requests are welcome. Please keep provider-specific behavior
+behind the normalized provider boundary and preserve the lightweight,
+glanceable character of the widget.

@@ -1,68 +1,63 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides project guidance for AI coding agents working in this
+repository.
 
 ## What This Is
 
-A macOS menu-bar widget (Tauri 2 + React + TypeScript) that displays live Claude Code usage stats. It runs as an `LSUIElement` background agent — no Dock icon, not in Cmd+Tab. The Rust backend reads `~/.claude/stats-cache.json` and scans session JSONL files directly; no external processes or Node runtime in production.
+QuotaGlass is a macOS menu-bar widget (Tauri 2 + React + TypeScript) for live
+AI agent usage. It supports Claude Code and Codex through provider-neutral
+frontend and Rust command contracts. It runs as an `LSUIElement` background
+agent with no Dock or Cmd+Tab presence.
 
 ## Commands
 
 ```bash
-# Development (hot-reload frontend + Rust backend)
 pnpm tauri dev
-
-# Type-check only
-pnpm build          # tsc + vite build (no Tauri)
-
-# Build, install to ~/Applications, and relaunch (one-step ship)
-pnpm ship           # runs scripts/deploy.sh
-
-# Build release bundle manually
+pnpm build
+pnpm ship
 pnpm tauri build --bundles app
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
-
-There are no tests in this project.
 
 ## Version Control
 
-GitButler is **not configured** for this repo. Use plain `git` for all commits, pushes, and branches — do not invoke the `/gitbutler` skill or `but` CLI here.
+GitButler is not configured for this repository. Use plain git.
 
 ## Architecture
 
-### Data flow
+Two provider-neutral Tauri commands serve the frontend:
 
-Two Tauri commands provide all data to the React frontend:
+- `get_provider_limits(provider)` returns a dynamic list of quota windows.
+- `get_provider_stats(provider)` returns summary metrics, 14-day activity,
+  per-model breakdown rows, and footer metadata.
 
-- **`get_usage_stats`** (`lib.rs:172`) — pure local reads. Merges `~/.claude/stats-cache.json` (pre-computed totals) with a delta scan of `~/.claude/projects/**/*.jsonl` for dates newer than `lastComputedDate`. Returns today's stats, 14-day sparkline, all-time totals, and output tokens by model.
+Claude uses its local stats cache, session JSONL files, macOS Keychain, and the
+Anthropic OAuth usage endpoint.
 
-- **`get_rate_limits`** (`lib.rs:337`) — network call. Reads the OAuth token from the macOS Keychain (`security find-generic-password -s "Claude Code-credentials"`), then `curl`s `https://api.anthropic.com/api/oauth/usage` to get `fiveHour`, `sevenDay`, and `sevenDaySonnet` utilization windows.
+Codex keeps a persistent `codex app-server --stdio` child and calls
+`account/rateLimits/read` plus `account/usage/read`. A cached, metadata-only
+scan of local Codex session JSONL files supplies session, prompt, tool, and
+per-model output-token details. Do not read Codex authentication files.
 
-### Frontend (`src/`)
+The React frontend has three persisted views: `superCompact`, `compact`, and
+`detailed`. Provider and view cycles are also exposed as global shortcuts:
 
-- `App.tsx` — single component. Three display modes:
-  - **Ultra-compact** (`ultra` state, persisted in `localStorage`): three unlabeled utilization bars
-  - **Normal compact** (default): labeled rate-limit bars with reset time
-  - **Expanded** (`expanded` state): adds today's message/session/tool counts, 14-day inline SVG sparkline, and per-model token bars
-- `types.ts` — TypeScript interfaces mirroring the Rust `#[derive(Serialize)]` structs
+- Control+Option+P — provider
+- Control+Option+V — view
+- Command+Shift+U — show/hide
 
-### Rust backend (`src-tauri/src/lib.rs`)
+The window remains fixed at 300px wide and content-driven in height. It snaps
+to and persists the nearest display corner.
 
-- Window is fixed at 300px wide; height is content-driven. The frontend measures `cardRef` height and calls `getCurrentWindow().setSize()` + `invoke("reanchor")` on every data change, and via `requestAnimationFrame` during CSS transitions (420ms window).
-- **Corner-snap**: after the user stops dragging for 350ms, the window snaps to the nearest display corner and persists the preference to `~/Library/Application Support/com.chulheong.claudeusage/.corner`.
-- **Login item**: `SMAppService.mainAppService()` (macOS 13+). Auto-registers on first release-build launch (guarded by a marker file). The tray "Start at Login" toggle stays in sync with System Settings.
-- Date math uses Howard Hinnant's civil-from-days algorithm (no `chrono` dependency) — UTC bucketing to match Claude Code's own stats cache.
+Bundle identifier: `com.chulheong.quotaglass`.
 
-### Key Tauri config (`src-tauri/tauri.conf.json`)
+## Adding a Provider
 
-- `decorations: false`, `transparent: true`, `alwaysOnTop: true`
-- `macOSPrivateApi: true` — required for the accessory activation policy
-- Bundle identifier: `com.chulheong.claudeusage`
+Add a new `ProviderId`, implement its normalized limits/stats adapter under
+`src-tauri/src/providers/`, then add its label and icon in `src/App.tsx`.
 
-## Adding a New Model
+## Adding a Model Label
 
-Add an entry to `NAMES` and `COLORS` in `src/App.tsx:9-23`. The `modelLabel()` fallback will handle unknown models gracefully.
-
-## Refreshing OAuth Token Logic
-
-`read_oauth_token()` (`lib.rs:313`) runs `security find-generic-password` synchronously inside the Tauri command. If the keychain item name ever changes in Claude Code, update the `-s` argument there.
+Add optional display names and colors to `NAMES` and `COLORS` in `src/App.tsx`.
+Unknown model names already have a readable fallback.

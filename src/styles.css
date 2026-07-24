@@ -38,6 +38,10 @@ body {
   color: #ededf2;
 }
 
+.card.provider-height-motion {
+  overflow: hidden;
+}
+
 /* ── header ── */
 
 .header {
@@ -56,6 +60,12 @@ body {
   font-weight: 700;
   color: #fff;
   letter-spacing: 0.1px;
+}
+
+.provider-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
 }
 
 /* header button group */
@@ -124,13 +134,58 @@ body {
   opacity: 0;
 }
 
-/* ── ultra-compact bars ── */
+/* ── provider row transitions ── */
 
-.ultra-bars {
+.limit-rows {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+}
+
+.limit-row-transition {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows 0.4s cubic-bezier(0.33, 0, 0.2, 1),
+    opacity 0.24s ease;
+}
+
+.limit-row-transition.entering,
+.limit-row-transition.exiting {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.limit-row-inner {
+  min-height: 0;
+  overflow: hidden;
+  transform: translateY(0);
+  transition: transform 0.4s cubic-bezier(0.33, 0, 0.2, 1);
+}
+
+.limit-row-transition.entering .limit-row-inner {
+  transform: translateY(4px);
+}
+
+.limit-row-transition.exiting .limit-row-inner {
+  transform: translateY(-4px);
+}
+
+.limit-rows-ultra {
   padding-bottom: 2px;
+  margin-bottom: -5px;
+}
+
+.limit-rows-ultra .limit-row-content {
+  padding-bottom: 5px;
+}
+
+.limit-rows-normal {
+  margin-bottom: -12px;
+}
+
+.limit-rows-normal .limit-row-content {
+  padding-bottom: 12px;
 }
 
 .ultra-track {
@@ -148,10 +203,6 @@ body {
 /* ── usage bars (primary view) ── */
 
 .usage-section {
-  margin-bottom: 12px;
-}
-
-.usage-section:last-of-type {
   margin-bottom: 0;
 }
 
@@ -194,6 +245,18 @@ body {
 
 .limits-err {
   color: #c95a8b;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .limit-row-transition,
+  .limit-row-inner {
+    transition: none;
+  }
+
+  .limit-row-transition.entering .limit-row-inner,
+  .limit-row-transition.exiting .limit-row-inner {
+    transform: none;
+  }
 }
 
 /* "Refreshed HH:MM:SS KST" — grid collapse so no empty space when hidden */

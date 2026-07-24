@@ -1,12 +1,12 @@
 [package]
-name = "claude-usage-widget"
+name = "quotaglass"
 version = "0.1.0"
-description = "Claude Code usage widget"
+description = "AI agent usage at a glance"
 authors = ["chulheong"]
 edition = "2021"
 
 [lib]
-name = "claude_usage_widget_lib"
+name = "quotaglass_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

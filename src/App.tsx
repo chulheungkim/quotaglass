@@ -1,12 +1,33 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ChevronDown, Minimize2, Maximize2, RefreshCw } from "lucide-react";
-import type { UsageStats, RateLimits, LimitWindow } from "./types";
-
-// ── model display helpers ─────────────────────────────────────────────────────
+import {
+  ArrowLeftRight,
+  ChevronDown,
+  Maximize2,
+  Minimize2,
+  RefreshCw,
+} from "lucide-react";
+import codexIcon from "./assets/codex-color-no-bg.svg";
+import {
+  nextProvider,
+  nextViewMode,
+  readProvider,
+  readViewMode,
+  saveProvider,
+  saveViewMode,
+} from "./provider";
+import type { ProviderId, ViewMode } from "./provider";
+import type { ProviderLimit, ProviderLimits, ProviderStats } from "./types";
+import { collectAsyncDisposers } from "./asyncDisposers";
 
 const NAMES: Record<string, string> = {
   "claude-sonnet-4-6": "Sonnet 4.6",
@@ -15,7 +36,6 @@ const NAMES: Record<string, string> = {
   "claude-opus-4-6": "Opus 4.6",
   "claude-haiku-4-5-20251001": "Haiku 4.5",
 };
-
 const COLORS: Record<string, string> = {
   "claude-sonnet-4-6": "#8B6FBF",
   "claude-opus-4-8": "#4AC9A0",
@@ -23,40 +43,33 @@ const COLORS: Record<string, string> = {
   "claude-opus-4-6": "#C95A8B",
   "claude-haiku-4-5-20251001": "#D9844A",
 };
-
 const FALLBACKS = ["#8B6FBF", "#4A90D9", "#4AC9A0", "#D9844A", "#C95A8B"];
 
 function modelLabel(key: string): string {
   if (NAMES[key]) return NAMES[key];
   return key
     .replace(/^claude-/, "")
+    .replace(/^gpt-/, "GPT ")
     .replace(/-\d{8,}$/, "")
     .replace(/-/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+    .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function modelColor(key: string, i: number): string {
-  return COLORS[key] ?? FALLBACKS[i % FALLBACKS.length];
+function modelColor(key: string, index: number): string {
+  return COLORS[key] ?? FALLBACKS[index % FALLBACKS.length];
 }
 
-// ── formatters ────────────────────────────────────────────────────────────────
-
-function compact(n: number): string {
-  if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, "") + "K";
-  return String(n);
+function compact(value: number): string {
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1).replace(/\.0$/, "")}M`;
+  if (value >= 1e3) return `${(value / 1e3).toFixed(1).replace(/\.0$/, "")}K`;
+  return String(value);
 }
 
-function fmtInt(n: number): string {
-  return n.toLocaleString("en-US");
+function mmdd(value: string): string {
+  const parts = value.split("-");
+  return parts.length === 3 ? `${parts[1]}/${parts[2]}` : value;
 }
 
-function mmdd(s: string): string {
-  const p = s.split("-");
-  return p.length === 3 ? `${p[1]}/${p[2]}` : s;
-}
-
-// 24-hour KST timestamp, e.g. "14:32:05 KST"
 function fmtKST(ms: number): string {
   return (
     new Date(ms).toLocaleTimeString("en-GB", {
@@ -68,38 +81,34 @@ function fmtKST(ms: number): string {
   );
 }
 
-// Matches Claude Code's own isQ() / WGA() formatter
-function formatReset(isoStr: string): string {
-  const d = new Date(isoStr);
+function formatReset(isoString: string): string {
+  const date = new Date(isoString);
   const now = new Date();
-  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const diffHours = (d.getTime() - now.getTime()) / 3_600_000;
-  const mins = d.getMinutes();
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const diffHours = (date.getTime() - now.getTime()) / 3_600_000;
+  const minutes = date.getMinutes();
 
   if (diffHours <= 24) {
-    const time = d
+    const time = date
       .toLocaleTimeString("en-US", {
         hour: "numeric",
-        minute: mins === 0 ? undefined : "2-digit",
+        minute: minutes === 0 ? undefined : "2-digit",
         hour12: true,
       })
-      .replace(/ ([AP]M)/i, (_, m: string) => m.toLowerCase());
-    return `Resets ${time} (${tz})`;
+      .replace(/ ([AP]M)/i, (_, marker: string) => marker.toLowerCase());
+    return `Resets ${time} (${timezone})`;
   }
-  const opts: Intl.DateTimeFormatOptions = {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: mins === 0 ? undefined : "2-digit",
-    hour12: true,
-  };
-  const str = d
-    .toLocaleString("en-US", opts)
-    .replace(/ ([AP]M)/i, (_, m: string) => m.toLowerCase());
-  return `Resets ${str} (${tz})`;
+  const value = date
+    .toLocaleString("en-US", {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: minutes === 0 ? undefined : "2-digit",
+      hour12: true,
+    })
+    .replace(/ ([AP]M)/i, (_, marker: string) => marker.toLowerCase());
+  return `Resets ${value} (${timezone})`;
 }
-
-// ── Claude icon ───────────────────────────────────────────────────────────────
 
 function ClaudeIcon() {
   return (
@@ -116,126 +125,319 @@ function ClaudeIcon() {
   );
 }
 
-// ── UsageBar ──────────────────────────────────────────────────────────────────
+function ProviderIcon({ provider }: { provider: ProviderId }) {
+  return provider === "claude" ? (
+    <ClaudeIcon />
+  ) : (
+    <img className="provider-icon" src={codexIcon} alt="" aria-hidden="true" />
+  );
+}
 
-function UsageBar({
-  title,
-  window: w,
-}: {
-  title: string;
-  window: LimitWindow | null;
-}) {
-  const pct = w?.utilization ?? 0;
-  const resetStr = w?.resetsAt ? formatReset(w.resetsAt) : null;
+function barColor(percent: number): string {
+  if (percent >= 90) return "#C95A8B";
+  if (percent >= 70) return "#D9844A";
+  return "#8B6FBF";
+}
 
-  let fillColor = "#8B6FBF";
-  if (pct >= 90) fillColor = "#C95A8B";
-  else if (pct >= 70) fillColor = "#D9844A";
-
+function UsageBar({ window }: { window: ProviderLimit }) {
+  const percent = window.utilization ?? 0;
   return (
     <div className="usage-section">
       <div className="usage-header">
-        <span className="usage-title">{title}</span>
-        <span className="usage-pct">{Math.floor(pct)}% used</span>
+        <span className="usage-title">{window.title}</span>
+        <span className="usage-pct">{Math.floor(percent)}% used</span>
       </div>
       <div className="track usage-track">
         <div
           className="fill usage-fill"
-          style={{ width: `${Math.max(0.5, pct)}%`, background: fillColor }}
+          style={{
+            width: `${Math.max(0.5, percent)}%`,
+            background: barColor(percent),
+          }}
         />
       </div>
-      <div className="usage-reset">{resetStr ?? "No recent usage"}</div>
+      <div className="usage-reset">
+        {window.resetsAt ? formatReset(window.resetsAt) : "No recent usage"}
+      </div>
     </div>
   );
 }
 
-// ── App ───────────────────────────────────────────────────────────────────────
+type LimitRowPhase = "entering" | "stable" | "exiting";
+type LimitRowVariant = "normal" | "ultra";
+
+interface LimitRowItem {
+  key: string;
+  window?: ProviderLimit;
+  message?: string;
+  error?: boolean;
+}
+
+interface TransitionLimitRow extends LimitRowItem {
+  phase: LimitRowPhase;
+  transition: number;
+}
+
+function limitRowItems(
+  provider: ProviderId,
+  limits: ProviderLimits | null,
+  error: string | null,
+): LimitRowItem[] {
+  if (error) {
+    return [{ key: `${provider}:error`, message: error, error: true }];
+  }
+  if (!limits) {
+    return [{ key: `${provider}:loading`, message: "Loading…" }];
+  }
+  if (limits.windows.length === 0) {
+    return [{ key: `${provider}:empty`, message: "No usage windows" }];
+  }
+  return limits.windows.map((window) => ({
+    key: `${provider}:${window.id}`,
+    window,
+  }));
+}
+
+function AnimatedLimitRows({
+  provider,
+  limits,
+  error,
+  variant,
+}: {
+  provider: ProviderId;
+  limits: ProviderLimits | null;
+  error: string | null;
+  variant: LimitRowVariant;
+}) {
+  const transitionRef = useRef(0);
+  const [rows, setRows] = useState<TransitionLimitRow[]>(() =>
+    limitRowItems(provider, limits, error).map((item) => ({
+      ...item,
+      phase: "stable",
+      transition: 0,
+    })),
+  );
+
+  useEffect(() => {
+    const transition = transitionRef.current + 1;
+    transitionRef.current = transition;
+    const nextItems = limitRowItems(provider, limits, error);
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setRows(
+        nextItems.map((item) => ({
+          ...item,
+          phase: "stable",
+          transition,
+        })),
+      );
+      return;
+    }
+    const nextByKey = new Map(nextItems.map((item) => [item.key, item]));
+
+    setRows((current) => {
+      const currentKeys = new Set(current.map((row) => row.key));
+      const reconciled = current.map((row): TransitionLimitRow => {
+        const next = nextByKey.get(row.key);
+        if (!next) {
+          return { ...row, phase: "exiting", transition };
+        }
+        if (row.phase === "exiting") {
+          return { ...next, phase: "entering", transition };
+        }
+        return { ...next, phase: row.phase, transition: row.transition };
+      });
+
+      for (const item of nextItems) {
+        if (!currentKeys.has(item.key)) {
+          reconciled.push({ ...item, phase: "entering", transition });
+        }
+      }
+      return reconciled;
+    });
+
+    let settleFrame = 0;
+    const prepareFrame = requestAnimationFrame(() => {
+      settleFrame = requestAnimationFrame(() => {
+        setRows((current) =>
+          current.map((row) =>
+            row.phase === "entering" && row.transition === transition
+              ? { ...row, phase: "stable" }
+              : row,
+          ),
+        );
+      });
+    });
+    const removeTimer = setTimeout(() => {
+      setRows((current) =>
+        current.filter(
+          (row) => row.phase !== "exiting" || row.transition !== transition,
+        ),
+      );
+    }, 420);
+
+    return () => {
+      cancelAnimationFrame(prepareFrame);
+      cancelAnimationFrame(settleFrame);
+      clearTimeout(removeTimer);
+    };
+  }, [provider, limits, error]);
+
+  return (
+    <div className={`limit-rows limit-rows-${variant}`}>
+      {rows.map((row) => (
+        <div className={`limit-row-transition ${row.phase}`} key={row.key}>
+          <div className="limit-row-inner">
+            <div className="limit-row-content">
+              {variant === "ultra" ? (
+                row.window ? (
+                  <div className="track ultra-track">
+                    <div
+                      className="fill"
+                      style={{
+                        width: `${Math.max(0.5, row.window.utilization ?? 0)}%`,
+                        background: barColor(row.window.utilization ?? 0),
+                      }}
+                    />
+                  </div>
+                ) : null
+              ) : row.window ? (
+                <UsageBar window={row.window} />
+              ) : (
+                <div className={`empty${row.error ? " limits-err" : ""}`}>
+                  {row.message}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function App() {
-  const [limits, setLimits] = useState<RateLimits | null>(null);
+  const [provider, setProvider] = useState<ProviderId>(readProvider);
+  const [view, setView] = useState<ViewMode>(readViewMode);
+  const [limits, setLimits] = useState<ProviderLimits | null>(null);
   const [limitsErr, setLimitsErr] = useState<string | null>(null);
-  const [stats, setStats] = useState<UsageStats | null>(null);
-  const [expanded, setExpanded] = useState(false);
-  const [ultra, setUltra] = useState(
-    () => localStorage.getItem("widget-ultra") === "1",
-  );
-  // Per-source loading flags — drives button spin and bar dim independently.
+  const [stats, setStats] = useState<ProviderStats | null>(null);
   const [loadingLimits, setLoadingLimits] = useState(false);
   const [loadingStats, setLoadingStats] = useState(false);
-  // "Refreshed HH:MM:SS KST" appears for 3.5 s after any limits fetch then fades.
-  // Always in DOM to avoid layout shift; visibility controlled by opacity.
   const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
   const [refreshedVisible, setRefreshedVisible] = useState(false);
+  const providerRef = useRef(provider);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const providerHeightAnimationRef = useRef<Animation | null>(null);
+  const providerHeightFromRef = useRef<number | null>(null);
+  const providerHeightMotionRef = useRef(false);
+  const providerHeightMotionTimerRef = useRef<
+    ReturnType<typeof setTimeout> | undefined
+  >(undefined);
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
-  const cardRef = useRef<HTMLDivElement>(null);
-
   const isRefreshing = loadingLimits || loadingStats;
+  const isSuperCompact = view === "superCompact";
+  const isDetailed = view === "detailed";
 
-  const toggleUltra = () =>
-    setUltra((u) => {
-      const next = !u;
-      localStorage.setItem("widget-ultra", next ? "1" : "0");
-      return next;
-    });
+  const selectProvider = useCallback((next: ProviderId) => {
+    const currentHeight = cardRef.current?.getBoundingClientRect().height;
+    if (currentHeight && currentHeight > 0) {
+      providerHeightFromRef.current = currentHeight;
+      providerHeightMotionRef.current = true;
+      clearTimeout(providerHeightMotionTimerRef.current);
+      providerHeightMotionTimerRef.current = setTimeout(() => {
+        providerHeightMotionRef.current = false;
+      }, 15_000);
+    }
+    providerRef.current = next;
+    saveProvider(next);
+    setProvider(next);
+    setLimits(null);
+    setStats(null);
+    setLimitsErr(null);
+  }, []);
 
-  // ── data loaders ─────────────────────────────────────────────────────────────
+  const selectView = useCallback((next: ViewMode) => {
+    saveViewMode(next);
+    setView(next);
+  }, []);
 
   const loadLimits = useCallback(async () => {
+    const requestedProvider = provider;
     setLoadingLimits(true);
     try {
-      const data = await invoke<RateLimits>("get_rate_limits");
+      const data = await invoke<ProviderLimits>("get_provider_limits", {
+        provider: requestedProvider,
+      });
+      if (providerRef.current !== requestedProvider) return;
       setLimits(data);
       setLimitsErr(null);
-      // Show the "Refreshed" timestamp, then fade it out after 3.5 s.
       setRefreshedAt(Date.now());
       setRefreshedVisible(true);
       clearTimeout(hideTimerRef.current);
       hideTimerRef.current = setTimeout(() => setRefreshedVisible(false), 3500);
-    } catch (e) {
-      setLimitsErr(String(e));
+    } catch (error) {
+      if (providerRef.current === requestedProvider) {
+        setLimitsErr(String(error));
+      }
     } finally {
-      setLoadingLimits(false);
+      if (providerRef.current === requestedProvider) setLoadingLimits(false);
     }
-  }, []);
+  }, [provider]);
 
   const loadStats = useCallback(async () => {
+    const requestedProvider = provider;
     setLoadingStats(true);
     try {
-      const data = await invoke<UsageStats>("get_usage_stats");
-      setStats(data);
+      const data = await invoke<ProviderStats>("get_provider_stats", {
+        provider: requestedProvider,
+      });
+      if (providerRef.current === requestedProvider) setStats(data);
     } catch {
-      /* ignore */
+      // Keep the last rendered local detail during transient provider errors.
     } finally {
-      setLoadingStats(false);
+      if (providerRef.current === requestedProvider) setLoadingStats(false);
     }
-  }, []);
+  }, [provider]);
 
-  // Rate limits — network call every 5 min, plus on-demand triggers
   useEffect(() => {
     loadLimits();
-    const id = setInterval(loadLimits, 300_000);
-    return () => clearInterval(id);
+    const interval = setInterval(loadLimits, 300_000);
+    return () => clearInterval(interval);
   }, [loadLimits]);
 
-  // Historical stats — local reads every 60 s (fallback; file watcher is primary)
   useEffect(() => {
     loadStats();
-    const id = setInterval(loadStats, 60_000);
-    return () => clearInterval(id);
+    const interval = setInterval(loadStats, 60_000);
+    return () => clearInterval(interval);
   }, [loadStats]);
 
-  // File watcher: Rust emits "usage-updated" when JSONL files change
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    listen("usage-updated", () => loadStats()).then((fn) => {
-      unlisten = fn;
+    listen<ProviderId>("usage-updated", ({ payload }) => {
+      if (payload === providerRef.current) loadStats();
+    }).then((dispose) => {
+      unlisten = dispose;
     });
     return () => unlisten?.();
   }, [loadStats]);
 
-  // Refresh both on window focus (widget shown after being hidden)
+  useEffect(() => {
+    return collectAsyncDisposers([
+      listen("provider-shortcut", () => {
+        selectProvider(nextProvider(providerRef.current));
+      }),
+      listen("view-shortcut", () => {
+        setView((current) => {
+          const next = nextViewMode(current);
+          saveViewMode(next);
+          return next;
+        });
+      }),
+    ]);
+  }, [selectProvider]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     getCurrentWindow()
@@ -245,56 +447,108 @@ export default function App() {
           loadLimits();
         }
       })
-      .then((fn) => {
-        unlisten = fn;
+      .then((dispose) => {
+        unlisten = dispose;
       });
     return () => unlisten?.();
-  }, [loadStats, loadLimits]);
+  }, [loadLimits, loadStats]);
 
-  // Clean up the hide-timer on unmount (defensive)
-  useEffect(() => () => clearTimeout(hideTimerRef.current), []);
+  useEffect(
+    () => () => {
+      clearTimeout(hideTimerRef.current);
+      clearTimeout(providerHeightMotionTimerRef.current);
+      providerHeightAnimationRef.current?.cancel();
+    },
+    [],
+  );
 
-  // ── window sizing ─────────────────────────────────────────────────────────────
+  useLayoutEffect(() => {
+    if (!providerHeightMotionRef.current) return;
+    const card = cardRef.current;
+    if (!card) return;
 
-  // Resize + reanchor when data arrives. set_height is atomic and skips
-  // repositioning while the user is dragging, so no mid-drag teleport.
+    const runningAnimation = providerHeightAnimationRef.current;
+    const currentHeight =
+      providerHeightFromRef.current ?? card.getBoundingClientRect().height;
+    providerHeightFromRef.current = null;
+
+    runningAnimation?.cancel();
+    providerHeightAnimationRef.current = null;
+    const targetHeight = Math.ceil(card.getBoundingClientRect().height);
+
+    if (
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
+      Math.abs(targetHeight - currentHeight) < 1
+    ) {
+      card.classList.remove("provider-height-motion");
+      return;
+    }
+
+    card.classList.add("provider-height-motion");
+    const animation = card.animate(
+      [{ height: `${currentHeight}px` }, { height: `${targetHeight}px` }],
+      {
+        duration: 420,
+        easing: "cubic-bezier(0.33, 0, 0.2, 1)",
+        fill: "both",
+      },
+    );
+    providerHeightAnimationRef.current = animation;
+    void animation.finished
+      .then(() => {
+        if (providerHeightAnimationRef.current !== animation) return;
+        animation.cancel();
+        providerHeightAnimationRef.current = null;
+        card.classList.remove("provider-height-motion");
+      })
+      .catch(() => undefined);
+  }, [provider, limits, limitsErr, stats]);
+
   useEffect(() => {
-    const el = cardRef.current;
-    if (!el) return;
-    const h = Math.ceil(el.getBoundingClientRect().height);
-    if (h > 0) invoke("set_height", { h }).catch(() => undefined);
+    if (
+      !providerHeightMotionRef.current ||
+      loadingLimits ||
+      loadingStats ||
+      (!limits && !limitsErr)
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      providerHeightMotionRef.current = false;
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [limits, limitsErr, loadingLimits, loadingStats, stats]);
+
+  useEffect(() => {
+    const element = cardRef.current;
+    if (!element) return;
+    const height = Math.ceil(element.getBoundingClientRect().height);
+    if (height > 0) invoke("set_height", { h: height }).catch(() => undefined);
   }, [limits, limitsErr, stats]);
 
-  // RAF-tracked resize during animated transitions. Runs for mode switches
-  // (expanded/ultra) and for the refreshed-stamp show/hide, so the window grows
-  // and shrinks in lockstep with the stamp's grid-collapse animation rather than
-  // clipping it or leaving a gap.
   useEffect(() => {
-    let raf: number;
+    let animationFrame: number;
     const deadline = Date.now() + 650;
-    let lastH = 0;
+    let lastHeight = 0;
     const poll = () => {
-      const el = cardRef.current;
-      if (el) {
-        const h = Math.ceil(el.getBoundingClientRect().height);
-        if (h > 0 && h !== lastH) {
-          lastH = h;
-          invoke("set_height", { h }).catch(() => undefined);
+      const element = cardRef.current;
+      if (element) {
+        const height = Math.ceil(element.getBoundingClientRect().height);
+        if (height > 0 && height !== lastHeight) {
+          lastHeight = height;
+          invoke("set_height", { h: height }).catch(() => undefined);
         }
       }
-      if (Date.now() < deadline) {
-        raf = requestAnimationFrame(poll);
-      }
+      if (Date.now() < deadline) animationFrame = requestAnimationFrame(poll);
     };
-    raf = requestAnimationFrame(poll);
-    return () => cancelAnimationFrame(raf);
-  }, [expanded, ultra, refreshedVisible]);
+    animationFrame = requestAnimationFrame(poll);
+    return () => cancelAnimationFrame(animationFrame);
+  }, [view, refreshedVisible, provider, limits, limitsErr, stats]);
 
-  // ── drag ─────────────────────────────────────────────────────────────────────
-
-  const onCardMouseDown = (e: ReactMouseEvent) => {
-    if (e.button !== 0) return;
-    if (e.target instanceof Element && e.target.closest("button")) return;
+  const onCardMouseDown = (event: ReactMouseEvent) => {
+    if (event.button !== 0) return;
+    if (event.target instanceof Element && event.target.closest("button"))
+      return;
     invoke("begin_drag").catch(() => undefined);
     getCurrentWindow()
       .startDragging()
@@ -302,44 +556,43 @@ export default function App() {
   };
 
   const handleRefresh = async () => {
-    if (isRefreshing) return;
-    await Promise.all([loadStats(), loadLimits()]);
+    if (!isRefreshing) await Promise.all([loadStats(), loadLimits()]);
   };
 
-  // ── derived display data ──────────────────────────────────────────────────────
-
-  const tokenRows = stats
-    ? Object.entries(stats.modelTokens)
-        .filter(([k, v]) => k !== "<synthetic>" && v > 0)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-    : [];
-  const totalTok = tokenRows.reduce((s, [, v]) => s + v, 0);
-  const maxTok = tokenRows.length > 0 ? tokenRows[0][1] : 1;
-
+  const breakdownRows =
+    stats?.breakdown
+      .filter((row) => row.key !== "<synthetic>" && row.value > 0)
+      .slice(0, 5) ?? [];
+  const totalBreakdown = breakdownRows.reduce((sum, row) => sum + row.value, 0);
+  const maxBreakdown = breakdownRows[0]?.value ?? 1;
   const days = stats?.daily14 ?? [];
-  const barW = 4,
-    gap = 3,
-    svgH = 40;
-  const maxMsg = Math.max(1, ...days.map((d) => d.messages));
-  const svgW = Math.max(
+  const barWidth = 4;
+  const gap = 3;
+  const svgHeight = 40;
+  const maxActivity = Math.max(1, ...days.map((day) => day.value));
+  const svgWidth = Math.max(
     1,
-    days.length * barW + Math.max(0, days.length - 1) * gap,
+    days.length * barWidth + Math.max(0, days.length - 1) * gap,
   );
-
-  // ── render ────────────────────────────────────────────────────────────────────
 
   return (
     <div className="card" ref={cardRef} onMouseDown={onCardMouseDown}>
-      {/* Header */}
       <div className="header">
         <div className="title">
-          <ClaudeIcon />
-          <span className={`title-text${ultra ? " hidden" : ""}`}>
-            Claude Code
+          <ProviderIcon provider={provider} />
+          <span className={`title-text${isSuperCompact ? " hidden" : ""}`}>
+            {provider === "claude" ? "Claude Code" : "Codex"}
           </span>
         </div>
         <div className="header-btns">
+          <button
+            className="header-btn"
+            onClick={() => selectProvider(nextProvider(provider))}
+            title={`Switch to ${provider === "claude" ? "Codex" : "Claude Code"} (⌃⌥P)`}
+            aria-label={`Switch to ${provider === "claude" ? "Codex" : "Claude Code"}`}
+          >
+            <ArrowLeftRight size={11} />
+          </button>
           <button
             className="header-btn"
             onClick={handleRefresh}
@@ -351,128 +604,97 @@ export default function App() {
               className={isRefreshing ? "spinning" : undefined}
             />
           </button>
-          {/* Ultra-compact toggle */}
           <button
             className="header-btn"
-            onClick={toggleUltra}
-            title={ultra ? "Show details" : "Ultra compact"}
+            onClick={() =>
+              selectView(isSuperCompact ? "compact" : "superCompact")
+            }
+            title={
+              isSuperCompact ? "Compact view (⌃⌥V)" : "Super compact view (⌃⌥V)"
+            }
           >
-            {ultra ? <Maximize2 size={11} /> : <Minimize2 size={11} />}
+            {isSuperCompact ? <Maximize2 size={11} /> : <Minimize2 size={11} />}
           </button>
           <button
             className="expand-btn"
-            onClick={() => setExpanded((e) => !e)}
-            title={expanded ? "Collapse" : "Expand"}
+            onClick={() => selectView(isDetailed ? "compact" : "detailed")}
+            title={isDetailed ? "Compact view (⌃⌥V)" : "Detailed view (⌃⌥V)"}
           >
             <ChevronDown
               size={11}
-              className={`chevron ${expanded ? "chevron-up" : ""}`}
+              className={`chevron ${isDetailed ? "chevron-up" : ""}`}
             />
           </button>
         </div>
       </div>
 
-      {/* Ultra-compact: 3 visual-only bars, no labels */}
-      <div className={`mode-panel ultra-panel${ultra ? " visible" : ""}`}>
+      <div
+        className={`mode-panel ultra-panel${isSuperCompact ? " visible" : ""}`}
+      >
         <div
           className={`mode-panel-inner${loadingLimits ? " refreshing" : ""}`}
         >
-          <div className="ultra-bars">
-            {[limits?.fiveHour, limits?.sevenDay, limits?.sevenDaySonnet].map(
-              (w, i) => {
-                const pct = w?.utilization ?? 0;
-                let color = "#8B6FBF";
-                if (pct >= 90) color = "#C95A8B";
-                else if (pct >= 70) color = "#D9844A";
-                return (
-                  <div key={i} className="track ultra-track">
-                    <div
-                      className="fill"
-                      style={{
-                        width: `${Math.max(0.5, pct)}%`,
-                        background: color,
-                      }}
-                    />
-                  </div>
-                );
-              },
-            )}
-          </div>
+          <AnimatedLimitRows
+            provider={provider}
+            limits={limits}
+            error={limitsErr}
+            variant="ultra"
+          />
         </div>
       </div>
 
-      {/* Normal compact: rate-limit bars with labels. */}
-      <div className={`mode-panel normal-panel${ultra ? "" : " visible"}`}>
+      <div
+        className={`mode-panel normal-panel${isSuperCompact ? "" : " visible"}`}
+      >
         <div
           className={`mode-panel-inner${loadingLimits ? " refreshing" : ""}`}
         >
-          {limitsErr ? (
-            <div className="empty limits-err">{limitsErr}</div>
-          ) : !limits ? (
-            <div className="empty">Loading…</div>
-          ) : null}
-          <UsageBar title="Current session" window={limits?.fiveHour ?? null} />
-          <UsageBar
-            title="Current week (all models)"
-            window={limits?.sevenDay ?? null}
+          <AnimatedLimitRows
+            provider={provider}
+            limits={limits}
+            error={limitsErr}
+            variant="normal"
           />
-          <UsageBar
-            title="Current week (Sonnet only)"
-            window={limits?.sevenDaySonnet ?? null}
-          />
-          {/* Collapses to zero height when hidden — no empty space reservation */}
           <div
             className={`refreshed-wrapper${refreshedVisible ? " visible" : ""}`}
           >
             <div className="refreshed-inner">
               <div className="refreshed-at">
-                {refreshedAt !== null ? `Refreshed ${fmtKST(refreshedAt)}` : ""}
+                {refreshedAt === null
+                  ? ""
+                  : `${limits?.stale ? "Cached" : "Refreshed"} ${fmtKST(
+                      refreshedAt,
+                    )}`}
               </div>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Expandable details — always in DOM so CSS can animate height */}
-      <div className={`details-wrapper${expanded ? " open" : ""}`}>
+      <div className={`details-wrapper${isDetailed ? " open" : ""}`}>
         <div className="details-inner">
           <div className="divider" />
-
           {stats ? (
             <>
-              {/* Today quick stats */}
               <div className={`stats${loadingStats ? " refreshing" : ""}`}>
-                <div className="stat">
-                  <div className="stat-value">
-                    {compact(stats.today.messages)}
+                {stats.metrics.slice(0, 3).map((metric) => (
+                  <div className="stat" key={metric.label}>
+                    <div className="stat-value">{compact(metric.value)}</div>
+                    <div className="stat-label">{metric.label}</div>
                   </div>
-                  <div className="stat-label">Messages</div>
-                </div>
-                <div className="stat">
-                  <div className="stat-value">
-                    {fmtInt(stats.today.sessions)}
-                  </div>
-                  <div className="stat-label">Sessions</div>
-                </div>
-                <div className="stat">
-                  <div className="stat-value">
-                    {compact(stats.today.toolCalls)}
-                  </div>
-                  <div className="stat-label">Tools</div>
-                </div>
+                ))}
               </div>
 
-              {/* 14-day sparkline */}
               {days.length > 0 && (
                 <>
                   <div className="section-label" style={{ marginTop: 14 }}>
-                    14-Day Activity
+                    {stats.activityLabel}
                   </div>
                   <svg
                     className="spark"
                     width="100%"
-                    height={svgH}
-                    viewBox={`0 0 ${svgW} ${svgH}`}
+                    height={svgHeight}
+                    viewBox={`0 0 ${svgWidth} ${svgHeight}`}
                     preserveAspectRatio="none"
                   >
                     <defs>
@@ -481,15 +703,18 @@ export default function App() {
                         <stop offset="100%" stopColor="#4A90D9" />
                       </linearGradient>
                     </defs>
-                    {days.map((d, i) => {
-                      const h = Math.max(2, (d.messages / maxMsg) * svgH);
+                    {days.map((day, index) => {
+                      const height = Math.max(
+                        2,
+                        (day.value / maxActivity) * svgHeight,
+                      );
                       return (
                         <rect
-                          key={d.date}
-                          x={i * (barW + gap)}
-                          y={svgH - h}
-                          width={barW}
-                          height={h}
+                          key={day.date}
+                          x={index * (barWidth + gap)}
+                          y={svgHeight - height}
+                          width={barWidth}
+                          height={height}
                           rx={2}
                           ry={2}
                           fill="url(#sg)"
@@ -504,28 +729,32 @@ export default function App() {
                 </>
               )}
 
-              {/* Tokens by model */}
-              {tokenRows.length > 0 && (
+              {breakdownRows.length > 0 && (
                 <>
                   <div className="divider" />
-                  <div className="section-label">Tokens by Model</div>
-                  {tokenRows.map(([key, val], i) => {
-                    const pct = (val / maxTok) * 100;
-                    const share = ((val / (totalTok || 1)) * 100).toFixed(0);
+                  <div className="section-label">{stats.breakdownLabel}</div>
+                  {breakdownRows.map((row, index) => {
+                    const percent = (row.value / maxBreakdown) * 100;
+                    const share = (
+                      (row.value / (totalBreakdown || 1)) *
+                      100
+                    ).toFixed(0);
                     return (
-                      <div className="token-row" key={key}>
+                      <div className="token-row" key={row.key}>
                         <div className="token-meta">
-                          <span className="token-name">{modelLabel(key)}</span>
+                          <span className="token-name">
+                            {modelLabel(row.key)}
+                          </span>
                           <span className="token-val">
-                            {compact(val)} · {share}%
+                            {compact(row.value)} · {share}%
                           </span>
                         </div>
                         <div className="track">
                           <div
                             className="fill"
                             style={{
-                              width: `${Math.max(2, pct)}%`,
-                              background: modelColor(key, i),
+                              width: `${Math.max(2, percent)}%`,
+                              background: modelColor(row.key, index),
                             }}
                           />
                         </div>
@@ -535,17 +764,25 @@ export default function App() {
                 </>
               )}
 
-              {/* Footer */}
               <div className="divider" />
               <div className="footer">
-                <span>{fmtInt(stats.allTime.sessions)} sessions</span>
-                <span className="sep">•</span>
-                <span>{fmtInt(stats.allTime.messages)} messages</span>
+                {stats.footer.map((item, index) => (
+                  <span key={item}>
+                    {index > 0 && <span className="sep">•&nbsp; </span>}
+                    {item}
+                  </span>
+                ))}
                 {stats.since && (
-                  <>
-                    <span className="sep">•</span>
-                    <span>Since {stats.since}</span>
-                  </>
+                  <span>
+                    <span className="sep">•&nbsp; </span>
+                    Since {stats.since}
+                  </span>
+                )}
+                {stats.dataScope && (
+                  <span>
+                    <span className="sep">•&nbsp; </span>
+                    {stats.dataScope}
+                  </span>
                 )}
               </div>
             </>

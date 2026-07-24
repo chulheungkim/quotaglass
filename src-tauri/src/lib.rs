@@ -1,21 +1,23 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use notify::{RecursiveMode, Watcher};
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
+use codex_rpc::CodexAppServer;
+use providers::{ProviderId, ProviderLimits, ProviderStats};
+
 // ── tray icon ────────────────────────────────────────────────────────────────
 
+mod codex_rpc;
+mod providers;
 mod tray_icon;
 
 fn make_tray_icon() -> tauri::image::Image<'static> {
@@ -43,86 +45,16 @@ struct DragState {
     drag_watching: AtomicBool,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
-// ── Rate-limit usage structs (for /api/oauth/usage) ──────────────────────────
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct LimitWindow {
-    utilization: Option<f64>,
-    resets_at: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RateLimits {
-    five_hour: Option<LimitWindow>,
-    seven_day: Option<LimitWindow>,
-    seven_day_sonnet: Option<LimitWindow>,
-    // True when one or more windows came from the on-disk cache because the live
-    // API returned null/error — so the widget can always show last-known usage.
-    stale: bool,
-    // Epoch millis of the cached data when stale; None when fully live.
-    cached_at: Option<u64>,
-}
-
-// Last-known-good windows, persisted so usage is shown even when the live API
-// intermittently returns null windows (observed even with a valid token) or the
-// token has expired between Claude Code sessions.
-#[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct CachedLimits {
-    five_hour: Option<LimitWindow>,
-    seven_day: Option<LimitWindow>,
-    seven_day_sonnet: Option<LimitWindow>,
-    saved_at: Option<u64>,
-}
-
-// ── Historical usage structs ──────────────────────────────────────────────────
-
-#[derive(Serialize)]
-pub struct DayStat {
-    date: String,
-    messages: i64,
-    sessions: i64,
-    tools: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Today {
-    date: String,
-    messages: i64,
-    sessions: i64,
-    tool_calls: i64,
-}
-
-#[derive(Serialize)]
-pub struct AllTime {
-    sessions: i64,
-    messages: i64,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageStats {
-    today: Today,
-    daily14: Vec<DayStat>,
-    model_tokens: HashMap<String, i64>,
-    all_time: AllTime,
-    since: Option<String>,
-    last_updated: String,
-}
-
 // Convert a count of days since the Unix epoch into (year, month, day).
 // Howard Hinnant's civil-from-days algorithm; pure std, no chrono dependency.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
     let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
     let doe = z - era * 146097;
@@ -135,13 +67,13 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn date_from_secs(secs: i64) -> String {
+pub(crate) fn date_from_secs(secs: i64) -> String {
     let days = secs.div_euclid(86400);
     let (y, m, d) = civil_from_days(days);
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-fn today_date() -> String {
+pub(crate) fn today_date() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -149,392 +81,79 @@ fn today_date() -> String {
     date_from_secs(secs)
 }
 
-fn file_mtime_date(path: &Path) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
-    Some(date_from_secs(secs))
-}
-
-fn process_file(
-    path: &Path,
-    last_computed: &str,
-    dm: &mut HashMap<String, i64>,
-    ds: &mut HashMap<String, HashSet<String>>,
-    dt: &mut HashMap<String, i64>,
-    dmt: &mut HashMap<String, i64>,
-) {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let obj: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let ts = match obj.get("timestamp").and_then(|v| v.as_str()) {
-            Some(t) if t.len() >= 10 => t,
-            _ => continue,
-        };
-        let date = &ts[0..10];
-        if date <= last_computed {
-            continue;
-        }
-        let outer_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if outer_type == "user" {
-            *dm.entry(date.to_string()).or_insert(0) += 1;
-            let sid = obj
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .or_else(|| obj.get("parentUuid").and_then(|v| v.as_str()));
-            if let Some(sid) = sid {
-                ds.entry(date.to_string())
-                    .or_default()
-                    .insert(sid.to_string());
-            }
-        } else if outer_type == "assistant" {
-            if let Some(msg) = obj.get("message") {
-                if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
-                    let tools = content
-                        .iter()
-                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-                        .count() as i64;
-                    if tools > 0 {
-                        *dt.entry(date.to_string()).or_insert(0) += tools;
-                    }
-                }
-                let model = msg.get("model").and_then(|v| v.as_str());
-                let out = msg
-                    .get("usage")
-                    .and_then(|u| u.get("output_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                if let (Some(model), true) = (model, out != 0) {
-                    *dmt.entry(model.to_string()).or_insert(0) += out;
-                }
-            }
-        }
-    }
-}
-
-// Async wrapper: the heavy JSONL scan is offloaded to the blocking thread pool
-// so it never stalls the main UI thread (which would trigger the macOS beachball).
 #[tauri::command]
-async fn get_usage_stats() -> Result<UsageStats, String> {
-    tauri::async_runtime::spawn_blocking(get_usage_stats_impl)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-fn get_usage_stats_impl() -> Result<UsageStats, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-    let cache_path = format!("{home}/.claude/stats-cache.json");
-    let projects_dir = format!("{home}/.claude/projects");
-
-    let cache: Value = fs::read_to_string(&cache_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Null);
-
-    let last_computed = cache
-        .get("lastComputedDate")
-        .and_then(|v| v.as_str())
-        .unwrap_or("2000-01-01")
-        .to_string();
-
-    let mut dm: HashMap<String, i64> = HashMap::new();
-    let mut ds: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut dt: HashMap<String, i64> = HashMap::new();
-    let mut dmt: HashMap<String, i64> = HashMap::new();
-
-    if let Ok(entries) = fs::read_dir(&projects_dir) {
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            if let Ok(files) = fs::read_dir(&dir) {
-                for f in files.flatten() {
-                    let p = f.path();
-                    if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                        continue;
-                    }
-                    if let Some(fdate) = file_mtime_date(&p) {
-                        if fdate.as_str() <= last_computed.as_str() {
-                            continue;
-                        }
-                    }
-                    process_file(&p, &last_computed, &mut dm, &mut ds, &mut dt, &mut dmt);
-                }
-            }
-        }
-    }
-
-    // Merge cached daily activity with the freshly scanned delta.
-    let mut daily: HashMap<String, (i64, i64, i64)> = HashMap::new();
-    if let Some(arr) = cache.get("dailyActivity").and_then(|v| v.as_array()) {
-        for d in arr {
-            let date = d.get("date").and_then(|v| v.as_str()).unwrap_or("");
-            if date.is_empty() {
-                continue;
-            }
-            let m = d.get("messageCount").and_then(|v| v.as_i64()).unwrap_or(0);
-            let s = d.get("sessionCount").and_then(|v| v.as_i64()).unwrap_or(0);
-            let t = d.get("toolCallCount").and_then(|v| v.as_i64()).unwrap_or(0);
-            daily.insert(date.to_string(), (m, s, t));
-        }
-    }
-    let mut delta_dates: HashSet<String> = HashSet::new();
-    delta_dates.extend(dm.keys().cloned());
-    delta_dates.extend(ds.keys().cloned());
-    delta_dates.extend(dt.keys().cloned());
-    for date in &delta_dates {
-        let e = daily.entry(date.clone()).or_insert((0, 0, 0));
-        e.0 += dm.get(date).copied().unwrap_or(0);
-        e.1 += ds.get(date).map(|s| s.len() as i64).unwrap_or(0);
-        e.2 += dt.get(date).copied().unwrap_or(0);
-    }
-
-    let mut dates: Vec<String> = daily.keys().cloned().collect();
-    dates.sort();
-    let daily14: Vec<DayStat> = dates
-        .iter()
-        .rev()
-        .take(14)
-        .rev()
-        .map(|d| {
-            let v = daily[d];
-            DayStat {
-                date: d.clone(),
-                messages: v.0,
-                sessions: v.1,
-                tools: v.2,
-            }
-        })
-        .collect();
-
-    let today_str = today_date();
-    let tv = daily.get(&today_str).copied().unwrap_or((0, 0, 0));
-    let today = Today {
-        date: today_str.clone(),
-        messages: tv.0,
-        sessions: tv.1,
-        tool_calls: tv.2,
-    };
-
-    let mut model_tokens: HashMap<String, i64> = HashMap::new();
-    if let Some(mu) = cache.get("modelUsage").and_then(|v| v.as_object()) {
-        for (model, usage) in mu {
-            let out = usage
-                .get("outputTokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            model_tokens.insert(model.clone(), out);
-        }
-    }
-    for (model, out) in &dmt {
-        *model_tokens.entry(model.clone()).or_insert(0) += *out;
-    }
-
-    let delta_sessions: i64 = ds.values().map(|s| s.len() as i64).sum();
-    let delta_messages: i64 = dm.values().sum();
-    let all_time = AllTime {
-        sessions: cache
-            .get("totalSessions")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            + delta_sessions,
-        messages: cache
-            .get("totalMessages")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            + delta_messages,
-    };
-
-    let since = cache
-        .get("firstSessionDate")
-        .and_then(|v| v.as_str())
-        .map(|s| s.chars().take(10).collect::<String>());
-
-    Ok(UsageStats {
-        today,
-        daily14,
-        model_tokens,
-        all_time,
-        since,
-        last_updated: today_str,
+async fn get_provider_limits(
+    provider: ProviderId,
+    codex: tauri::State<'_, CodexAppServer>,
+) -> Result<ProviderLimits, String> {
+    let support = app_support_dir();
+    let codex = codex.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || match provider {
+        ProviderId::Claude => providers::claude::get_limits(&support),
+        ProviderId::Codex => providers::codex::get_limits(&codex),
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
-fn read_oauth_token() -> Option<String> {
-    let username = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string());
-    let out = Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-a",
-            &username,
-            "-w",
-            "-s",
-            "Claude Code-credentials",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let creds_json = String::from_utf8(out.stdout).ok()?;
-    let v: Value = serde_json::from_str(creds_json.trim()).ok()?;
-    v.get("claudeAiOauth")?
-        .get("accessToken")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
-fn rate_cache_path() -> std::path::PathBuf {
-    app_support_dir().join("rate-limits-cache.json")
-}
-
-fn load_rate_cache() -> CachedLimits {
-    fs::read_to_string(rate_cache_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_rate_cache(c: &CachedLimits) {
-    let _ = fs::create_dir_all(app_support_dir());
-    if let Ok(s) = serde_json::to_string(c) {
-        let _ = fs::write(rate_cache_path(), s);
-    }
-}
-
-// Fall back to the last-known-good cache when the live fetch is unusable. Only
-// errors if we've never cached anything (so the UI shows a message, not blank).
-fn from_cache_or_err(cache: &CachedLimits, err: &str) -> Result<RateLimits, String> {
-    if cache.five_hour.is_some() || cache.seven_day.is_some() || cache.seven_day_sonnet.is_some() {
-        Ok(RateLimits {
-            five_hour: cache.five_hour.clone(),
-            seven_day: cache.seven_day.clone(),
-            seven_day_sonnet: cache.seven_day_sonnet.clone(),
-            stale: true,
-            cached_at: cache.saved_at,
-        })
-    } else {
-        Err(err.to_string())
-    }
-}
-
-// Async wrapper: the network curl (up to 8 s) and keychain read run on the
-// blocking thread pool, keeping the main thread responsive during refreshes.
 #[tauri::command]
-async fn get_rate_limits() -> Result<RateLimits, String> {
-    tauri::async_runtime::spawn_blocking(get_rate_limits_impl)
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-fn get_rate_limits_impl() -> Result<RateLimits, String> {
-    let cache = load_rate_cache();
-
-    let token = match read_oauth_token() {
-        Some(t) => t,
-        None => return from_cache_or_err(&cache, "No OAuth token found in keychain"),
-    };
-
-    let out = Command::new("/usr/bin/curl")
-        .args([
-            "-s",
-            "--max-time",
-            "8",
-            "-H",
-            &format!("Authorization: Bearer {token}"),
-            "-H",
-            "anthropic-beta: oauth-2025-04-20",
-            "https://api.anthropic.com/api/oauth/usage",
-        ])
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(e) => return from_cache_or_err(&cache, &format!("curl error: {e}")),
-    };
-
-    let body = match String::from_utf8(out.stdout) {
-        Ok(b) => b,
-        Err(e) => return from_cache_or_err(&cache, &format!("UTF-8 error: {e}")),
-    };
-    let data: Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(e) => return from_cache_or_err(&cache, &format!("JSON error: {e}")),
-    };
-
-    // An expired/invalid token returns {"type":"error","error":{...}} with no
-    // window keys — fall back to cached usage rather than blanking the panel.
-    if data.get("type").and_then(|v| v.as_str()) == Some("error") {
-        let msg = data
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("Usage unavailable");
-        return from_cache_or_err(&cache, msg);
-    }
-
-    let parse_window = |key: &str| -> Option<LimitWindow> {
-        let w = data.get(key)?;
-        if w.is_null() {
-            return None;
-        }
-        Some(LimitWindow {
-            utilization: w.get("utilization").and_then(|v| v.as_f64()),
-            resets_at: w
-                .get("resets_at")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-        })
-    };
-
-    let live_5 = parse_window("five_hour");
-    let live_7 = parse_window("seven_day");
-    let live_7s = parse_window("seven_day_sonnet");
-
-    // The API intermittently returns null windows even with a valid token. Keep
-    // the freshest known value per window so the widget always shows usage.
-    let five_hour = live_5.clone().or_else(|| cache.five_hour.clone());
-    let seven_day = live_7.clone().or_else(|| cache.seven_day.clone());
-    let seven_day_sonnet = live_7s.clone().or_else(|| cache.seven_day_sonnet.clone());
-
-    if live_5.is_some() || live_7.is_some() || live_7s.is_some() {
-        save_rate_cache(&CachedLimits {
-            five_hour: five_hour.clone(),
-            seven_day: seven_day.clone(),
-            seven_day_sonnet: seven_day_sonnet.clone(),
-            saved_at: Some(now_ms()),
-        });
-    }
-
-    // Stale if any returned window had to come from the cache this round.
-    let stale = (live_5.is_none() && five_hour.is_some())
-        || (live_7.is_none() && seven_day.is_some())
-        || (live_7s.is_none() && seven_day_sonnet.is_some());
-
-    Ok(RateLimits {
-        five_hour,
-        seven_day,
-        seven_day_sonnet,
-        stale,
-        cached_at: if stale { cache.saved_at } else { None },
+async fn get_provider_stats(
+    provider: ProviderId,
+    codex: tauri::State<'_, CodexAppServer>,
+) -> Result<ProviderStats, String> {
+    let codex = codex.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || match provider {
+        ProviderId::Claude => providers::claude::get_stats(),
+        ProviderId::Codex => providers::codex::get_stats(&codex),
     })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ── corner-placement system ───────────────────────────────────────────────────
 
-fn app_support_dir() -> std::path::PathBuf {
+pub(crate) fn app_support_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("Library/Application Support/com.chulheong.claudeusage")
+        .join("Library/Application Support/com.chulheong.quotaglass")
+}
+
+fn copy_missing_tree(source: &Path, destination: &Path, skip_login_marker: bool) {
+    let entries = match fs::read_dir(source) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    let _ = fs::create_dir_all(destination);
+    for entry in entries.flatten() {
+        let source_path = entry.path();
+        if skip_login_marker
+            && source_path.file_name().and_then(|name| name.to_str()) == Some(".login-registered")
+        {
+            continue;
+        }
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_missing_tree(&source_path, &destination_path, skip_login_marker);
+        } else if !destination_path.exists() {
+            let _ = fs::copy(source_path, destination_path);
+        }
+    }
+}
+
+fn migrate_legacy_state() {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let library = std::path::PathBuf::from(home).join("Library");
+    let old_support = library.join("Application Support/com.chulheong.claudeusage");
+    copy_missing_tree(&old_support, &app_support_dir(), true);
+
+    // Tauri's localStorage lives under the bundle-specific WebKit directory.
+    // Copy it only before the new bundle creates its own store.
+    let old_webkit = library.join("WebKit/com.chulheong.claudeusage");
+    let new_webkit = library.join("WebKit/com.chulheong.quotaglass");
+    if !new_webkit.exists() {
+        copy_missing_tree(&old_webkit, &new_webkit, false);
+    }
 }
 
 fn load_corner() -> String {
@@ -757,7 +376,7 @@ mod login_item {
             return;
         };
         let marker = std::path::PathBuf::from(home)
-            .join("Library/Application Support/com.chulheong.claudeusage/.login-registered");
+            .join("Library/Application Support/com.chulheong.quotaglass/.login-registered");
         if marker.exists() {
             return;
         }
@@ -795,9 +414,23 @@ fn toggle_window(app: &tauri::AppHandle) {
     }
 }
 
+fn show_hide_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyU)
+}
+
+fn provider_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP)
+}
+
+fn view_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    migrate_legacy_state();
     tauri::Builder::default()
+        .manage(CodexAppServer::default())
         .manage(DragState {
             is_dragging: AtomicBool::new(false),
             is_animating: AtomicBool::new(false),
@@ -806,18 +439,21 @@ pub fn run() {
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if event.state() == ShortcutState::Pressed
-                        && shortcut
-                            == &Shortcut::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::KeyU)
-                    {
-                        toggle_window(app);
+                    if event.state() == ShortcutState::Pressed {
+                        if shortcut == &show_hide_shortcut() {
+                            toggle_window(app);
+                        } else if shortcut == &provider_shortcut() {
+                            let _ = app.emit("provider-shortcut", ());
+                        } else if shortcut == &view_shortcut() {
+                            let _ = app.emit("view-shortcut", ());
+                        }
                     }
                 })
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![
-            get_usage_stats,
-            get_rate_limits,
+            get_provider_stats,
+            get_provider_limits,
             begin_drag,
             set_height,
             reanchor,
@@ -841,10 +477,15 @@ pub fn run() {
             // Global show/hide hotkey: Cmd+Shift+U (U = Usage). Chosen to avoid
             // common app/system bindings. Ignore errors so a conflicting binding
             // never blocks startup.
-            let _ = app.global_shortcut().register(Shortcut::new(
-                Some(Modifiers::SUPER | Modifiers::SHIFT),
-                Code::KeyU,
-            ));
+            for (label, shortcut) in [
+                ("show/hide", show_hide_shortcut()),
+                ("provider", provider_shortcut()),
+                ("view", view_shortcut()),
+            ] {
+                if let Err(error) = app.global_shortcut().register(shortcut) {
+                    eprintln!("Could not register {label} shortcut: {error}");
+                }
+            }
 
             // Menu-bar tray icon + menu.
             let toggle = MenuItemBuilder::with_id("toggle", "Show / Hide").build(app)?;
@@ -875,23 +516,26 @@ pub fn run() {
             // Dedicated 32×32 template icon keeps the menu-bar item at the
             // standard 16pt height. icon_as_template lets macOS invert it for
             // light/dark mode automatically.
-            tray = tray
-                .icon(make_tray_icon())
-                .icon_as_template(true);
+            tray = tray.icon(make_tray_icon()).icon_as_template(true);
             let _tray = tray.build(app)?;
 
             if let Some(win) = app.get_webview_window("main") {
                 position_at_corner(&win, &load_corner());
             }
 
-            // Watch ~/.claude/projects/ for JSONL writes; emit "usage-updated"
-            // to the frontend with a 1.5s debounce so rapid session writes
-            // coalesce into a single refresh rather than hammering get_usage_stats.
+            // Watch both providers' local session stores. The provider id in the
+            // event lets the frontend ignore background writes for the inactive
+            // provider while retaining one debounced watcher.
             if let Ok(home) = std::env::var("HOME") {
-                let projects_path = std::path::PathBuf::from(&home)
+                let claude_path = std::path::PathBuf::from(&home)
                     .join(".claude")
                     .join("projects");
-                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                let codex_path = std::path::PathBuf::from(&home)
+                    .join(".codex")
+                    .join("sessions");
+                let callback_claude_path = claude_path.clone();
+                let callback_codex_path = codex_path.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<ProviderId>();
                 let app_h = app.handle().clone();
 
                 let watcher_result =
@@ -902,30 +546,60 @@ pub fn run() {
                                 .iter()
                                 .any(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"));
                             if has_jsonl {
-                                let _ = tx.send(());
+                                let provider = if event
+                                    .paths
+                                    .iter()
+                                    .any(|path| path.starts_with(&callback_codex_path))
+                                {
+                                    ProviderId::Codex
+                                } else if event
+                                    .paths
+                                    .iter()
+                                    .any(|path| path.starts_with(&callback_claude_path))
+                                {
+                                    ProviderId::Claude
+                                } else {
+                                    return;
+                                };
+                                let _ = tx.send(provider);
                             }
                         }
                     });
 
                 if let Ok(mut watcher) = watcher_result {
-                    if watcher
-                        .watch(&projects_path, RecursiveMode::Recursive)
-                        .is_ok()
+                    let mut watching = false;
+                    if claude_path.exists()
+                        && watcher
+                            .watch(&claude_path, RecursiveMode::Recursive)
+                            .is_ok()
                     {
+                        watching = true;
+                    }
+                    if codex_path.exists()
+                        && watcher.watch(&codex_path, RecursiveMode::Recursive).is_ok()
+                    {
+                        watching = true;
+                    }
+                    if watching {
                         // Debounce: emit only after 1.5 s of silence.
                         std::thread::spawn(move || {
-                            let mut last: Option<Instant> = None;
+                            let mut pending: HashMap<ProviderId, Instant> = HashMap::new();
                             loop {
                                 match rx.recv_timeout(Duration::from_millis(100)) {
-                                    Ok(()) => {
-                                        last = Some(Instant::now());
+                                    Ok(provider) => {
+                                        pending.insert(provider, Instant::now());
                                     }
                                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                        if let Some(t) = last {
-                                            if t.elapsed() >= Duration::from_millis(1500) {
-                                                let _ = app_h.emit("usage-updated", ());
-                                                last = None;
-                                            }
+                                        let ready: Vec<_> = pending
+                                            .iter()
+                                            .filter(|(_, updated)| {
+                                                updated.elapsed() >= Duration::from_millis(1500)
+                                            })
+                                            .map(|(provider, _)| *provider)
+                                            .collect();
+                                        for provider in ready {
+                                            let _ = app_h.emit("usage-updated", provider);
+                                            pending.remove(&provider);
                                         }
                                     }
                                     Err(_) => break,
@@ -941,4 +615,33 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_does_not_overwrite_new_state_or_copy_login_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "quotaglass-migration-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let old = root.join("old");
+        let new = root.join("new");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join(".corner"), "tl").unwrap();
+        fs::write(old.join(".login-registered"), "1").unwrap();
+        fs::write(old.join("cache.json"), "{}").unwrap();
+        fs::write(new.join(".corner"), "br").unwrap();
+
+        copy_missing_tree(&old, &new, true);
+
+        assert_eq!(fs::read_to_string(new.join(".corner")).unwrap(), "br");
+        assert!(new.join("cache.json").exists());
+        assert!(!new.join(".login-registered").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 }
