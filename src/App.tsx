@@ -27,6 +27,7 @@ import {
 } from "./provider";
 import type { ProviderId, ViewMode } from "./provider";
 import type { ProviderLimit, ProviderLimits, ProviderStats } from "./types";
+import { collectAsyncDisposers } from "./asyncDisposers";
 
 const NAMES: Record<string, string> = {
   "claude-sonnet-4-6": "Sonnet 4.6",
@@ -423,8 +424,7 @@ export default function App() {
   }, [loadStats]);
 
   useEffect(() => {
-    const disposers: Array<() => void> = [];
-    Promise.all([
+    return collectAsyncDisposers([
       listen("provider-shortcut", () => {
         selectProvider(nextProvider(providerRef.current));
       }),
@@ -435,8 +435,7 @@ export default function App() {
           return next;
         });
       }),
-    ]).then((listeners) => disposers.push(...listeners));
-    return () => disposers.forEach((dispose) => dispose());
+    ]);
   }, [selectProvider]);
 
   useEffect(() => {
