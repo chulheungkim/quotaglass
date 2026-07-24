@@ -1,5 +1,5 @@
 // Generates a 1024x1024 source PNG for `tauri icon` — a purple→blue rounded
-// square with the white "●" Claude dot. Pure Node, no dependencies.
+// square with a white center mark. Pure Node, no dependencies.
 const fs = require("fs");
 const zlib = require("zlib");
 const path = require("path");
