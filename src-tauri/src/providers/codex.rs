@@ -230,28 +230,28 @@ fn parse_limits(
 fn parse_window(id: &str, window: Option<&Value>) -> Option<ProviderLimit> {
     let window = window?.as_object()?;
     let duration = window.get("windowDurationMins").and_then(Value::as_i64);
-    let title = match (id, duration) {
-        ("primary", _) => "Current session",
-        ("secondary", _) => "Current week",
-        (_, Some(minutes)) if minutes % 1_440 == 0 => {
-            return Some(make_window(
-                id,
-                format!("{}-day", minutes / 1_440),
-                duration,
-                window,
-            ))
+    Some(make_window(
+        id,
+        window_title(id, duration),
+        duration,
+        window,
+    ))
+}
+
+fn window_title(id: &str, duration: Option<i64>) -> String {
+    match duration {
+        Some(300) => "5-hour usage".to_string(),
+        Some(10_080) => "Weekly usage".to_string(),
+        Some(minutes) if minutes > 0 && minutes % 1_440 == 0 => {
+            format!("{}-day usage", minutes / 1_440)
         }
-        (_, Some(minutes)) if minutes % 60 == 0 => {
-            return Some(make_window(
-                id,
-                format!("{}-hour", minutes / 60),
-                duration,
-                window,
-            ))
+        Some(minutes) if minutes > 0 && minutes % 60 == 0 => {
+            format!("{}-hour usage", minutes / 60)
         }
-        _ => "Secondary",
-    };
-    Some(make_window(id, title.to_string(), duration, window))
+        _ if id == "primary" => "Primary usage".to_string(),
+        _ if id == "secondary" => "Secondary usage".to_string(),
+        _ => "Usage".to_string(),
+    }
 }
 
 fn make_window(
@@ -528,10 +528,28 @@ mod tests {
             }
         });
         let parsed = parse_limits(&value, false, None).unwrap();
-        assert_eq!(parsed.windows[0].title, "Current session");
-        assert_eq!(parsed.windows[1].title, "Current week");
+        assert_eq!(parsed.windows[0].title, "5-hour usage");
+        assert_eq!(parsed.windows[1].title, "Weekly usage");
         assert_eq!(parsed.plan.as_deref(), Some("plus"));
         assert_eq!(parsed.credit_balance.as_deref(), Some("3.50"));
+    }
+
+    #[test]
+    fn labels_single_primary_window_by_duration() {
+        let value = serde_json::json!({
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 22,
+                    "windowDurationMins": 10080,
+                    "resetsAt": 1_785_385_956_i64
+                },
+                "secondary": null,
+                "planType": "prolite"
+            }
+        });
+        let parsed = parse_limits(&value, false, None).unwrap();
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(parsed.windows[0].title, "Weekly usage");
     }
 
     #[test]

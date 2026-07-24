@@ -69,8 +69,9 @@ omitted.
 
 Claude produces its current three windows. Codex produces the live primary and
 secondary windows returned by its account interface, normally the five-hour and
-weekly windows. The UI renders the collection dynamically and never inserts a
-placeholder third Codex bar.
+weekly windows. Codex window labels derive from `windowDurationMins`, rather
+than assuming that a primary window is session-based. The UI renders the
+collection dynamically and never inserts a placeholder third Codex bar.
 
 ### Statistics
 
@@ -177,7 +178,7 @@ prevents invalid combinations.
 ### Provider switching
 
 - `Control+Option+P` cycles Claude and Codex globally.
-- Clicking the provider icon/title performs the same action.
+- A distinct switch button in the widget header performs the same action.
 - The selected provider persists across launches.
 - Switching triggers an immediate provider-specific refresh.
 - A hidden widget remains hidden; `Cmd+Shift+U` remains the explicit Show/Hide

@@ -3,7 +3,13 @@ import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ChevronDown, Maximize2, Minimize2, RefreshCw } from "lucide-react";
+import {
+  ArrowLeftRight,
+  ChevronDown,
+  Maximize2,
+  Minimize2,
+  RefreshCw,
+} from "lucide-react";
 import codexIcon from "./assets/codex-color-no-bg.svg";
 import {
   nextProvider,
@@ -336,17 +342,21 @@ export default function App() {
   return (
     <div className="card" ref={cardRef} onMouseDown={onCardMouseDown}>
       <div className="header">
-        <button
-          className="title provider-switch"
-          onClick={() => selectProvider(nextProvider(provider))}
-          title="Switch provider (⌃⌥P)"
-        >
+        <div className="title">
           <ProviderIcon provider={provider} />
           <span className={`title-text${isSuperCompact ? " hidden" : ""}`}>
             {provider === "claude" ? "Claude Code" : "Codex"}
           </span>
-        </button>
+        </div>
         <div className="header-btns">
+          <button
+            className="header-btn provider-switch-btn"
+            onClick={() => selectProvider(nextProvider(provider))}
+            title={`Switch to ${provider === "claude" ? "Codex" : "Claude Code"} (⌃⌥P)`}
+            aria-label={`Switch to ${provider === "claude" ? "Codex" : "Claude Code"}`}
+          >
+            <ArrowLeftRight size={11} />
+          </button>
           <button
             className="header-btn"
             onClick={handleRefresh}
