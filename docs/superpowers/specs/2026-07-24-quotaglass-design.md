@@ -184,6 +184,8 @@ prevents invalid combinations.
 - Switching triggers an immediate provider-specific refresh.
 - The widget height transitions smoothly when the provider contents have
   different intrinsic heights.
+- Usage rows remain mounted through their exit transition while replacement
+  rows expand into place, including loading and error states.
 - A hidden widget remains hidden; `Cmd+Shift+U` remains the explicit Show/Hide
   shortcut.
 

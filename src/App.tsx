@@ -162,6 +162,158 @@ function UsageBar({ window }: { window: ProviderLimit }) {
   );
 }
 
+type LimitRowPhase = "entering" | "stable" | "exiting";
+type LimitRowVariant = "normal" | "ultra";
+
+interface LimitRowItem {
+  key: string;
+  window?: ProviderLimit;
+  message?: string;
+  error?: boolean;
+}
+
+interface TransitionLimitRow extends LimitRowItem {
+  phase: LimitRowPhase;
+  transition: number;
+}
+
+function limitRowItems(
+  provider: ProviderId,
+  limits: ProviderLimits | null,
+  error: string | null,
+): LimitRowItem[] {
+  if (error) {
+    return [{ key: `${provider}:error`, message: error, error: true }];
+  }
+  if (!limits) {
+    return [{ key: `${provider}:loading`, message: "Loading…" }];
+  }
+  if (limits.windows.length === 0) {
+    return [{ key: `${provider}:empty`, message: "No usage windows" }];
+  }
+  return limits.windows.map((window) => ({
+    key: `${provider}:${window.id}`,
+    window,
+  }));
+}
+
+function AnimatedLimitRows({
+  provider,
+  limits,
+  error,
+  variant,
+}: {
+  provider: ProviderId;
+  limits: ProviderLimits | null;
+  error: string | null;
+  variant: LimitRowVariant;
+}) {
+  const transitionRef = useRef(0);
+  const [rows, setRows] = useState<TransitionLimitRow[]>(() =>
+    limitRowItems(provider, limits, error).map((item) => ({
+      ...item,
+      phase: "stable",
+      transition: 0,
+    })),
+  );
+
+  useEffect(() => {
+    const transition = transitionRef.current + 1;
+    transitionRef.current = transition;
+    const nextItems = limitRowItems(provider, limits, error);
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setRows(
+        nextItems.map((item) => ({
+          ...item,
+          phase: "stable",
+          transition,
+        })),
+      );
+      return;
+    }
+    const nextByKey = new Map(nextItems.map((item) => [item.key, item]));
+
+    setRows((current) => {
+      const currentKeys = new Set(current.map((row) => row.key));
+      const reconciled = current.map((row): TransitionLimitRow => {
+        const next = nextByKey.get(row.key);
+        if (!next) {
+          return { ...row, phase: "exiting", transition };
+        }
+        if (row.phase === "exiting") {
+          return { ...next, phase: "entering", transition };
+        }
+        return { ...next, phase: row.phase, transition: row.transition };
+      });
+
+      for (const item of nextItems) {
+        if (!currentKeys.has(item.key)) {
+          reconciled.push({ ...item, phase: "entering", transition });
+        }
+      }
+      return reconciled;
+    });
+
+    let settleFrame = 0;
+    const prepareFrame = requestAnimationFrame(() => {
+      settleFrame = requestAnimationFrame(() => {
+        setRows((current) =>
+          current.map((row) =>
+            row.phase === "entering" && row.transition === transition
+              ? { ...row, phase: "stable" }
+              : row,
+          ),
+        );
+      });
+    });
+    const removeTimer = setTimeout(() => {
+      setRows((current) =>
+        current.filter(
+          (row) => row.phase !== "exiting" || row.transition !== transition,
+        ),
+      );
+    }, 420);
+
+    return () => {
+      cancelAnimationFrame(prepareFrame);
+      cancelAnimationFrame(settleFrame);
+      clearTimeout(removeTimer);
+    };
+  }, [provider, limits, error]);
+
+  return (
+    <div className={`limit-rows limit-rows-${variant}`}>
+      {rows.map((row) => (
+        <div className={`limit-row-transition ${row.phase}`} key={row.key}>
+          <div className="limit-row-inner">
+            <div className="limit-row-content">
+              {variant === "ultra" ? (
+                row.window ? (
+                  <div className="track ultra-track">
+                    <div
+                      className="fill"
+                      style={{
+                        width: `${Math.max(0.5, row.window.utilization ?? 0)}%`,
+                        background: barColor(row.window.utilization ?? 0),
+                      }}
+                    />
+                  </div>
+                ) : null
+              ) : row.window ? (
+                <UsageBar window={row.window} />
+              ) : (
+                <div className={`empty${row.error ? " limits-err" : ""}`}>
+                  {row.message}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [provider, setProvider] = useState<ProviderId>(readProvider);
   const [view, setView] = useState<ViewMode>(readViewMode);
@@ -483,22 +635,12 @@ export default function App() {
         <div
           className={`mode-panel-inner${loadingLimits ? " refreshing" : ""}`}
         >
-          <div className="ultra-bars">
-            {(limits?.windows ?? []).map((window) => {
-              const percent = window.utilization ?? 0;
-              return (
-                <div key={window.id} className="track ultra-track">
-                  <div
-                    className="fill"
-                    style={{
-                      width: `${Math.max(0.5, percent)}%`,
-                      background: barColor(percent),
-                    }}
-                  />
-                </div>
-              );
-            })}
-          </div>
+          <AnimatedLimitRows
+            provider={provider}
+            limits={limits}
+            error={limitsErr}
+            variant="ultra"
+          />
         </div>
       </div>
 
@@ -508,15 +650,12 @@ export default function App() {
         <div
           className={`mode-panel-inner${loadingLimits ? " refreshing" : ""}`}
         >
-          {limitsErr ? (
-            <div className="empty limits-err">{limitsErr}</div>
-          ) : !limits ? (
-            <div className="empty">Loading…</div>
-          ) : (
-            limits.windows.map((window) => (
-              <UsageBar key={window.id} window={window} />
-            ))
-          )}
+          <AnimatedLimitRows
+            provider={provider}
+            limits={limits}
+            error={limitsErr}
+            variant="normal"
+          />
           <div
             className={`refreshed-wrapper${refreshedVisible ? " visible" : ""}`}
           >
