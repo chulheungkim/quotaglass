@@ -1,0 +1,8 @@
+packages:
+  - .
+
+allowBuilds: {}
+
+minimumReleaseAgeExclude:
+  # Patched release for GHSA-r28c-9q8g-f849; remove after its 24-hour quarantine.
+  - postcss@8.5.23

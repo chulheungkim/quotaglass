@@ -66,13 +66,14 @@ network error does not immediately blank the widget.
 
 - macOS 13 or newer
 - Claude Code and/or Codex authenticated locally
-- Node.js, pnpm, and the Rust toolchain for development
+- Node.js 22.13 or newer, Corepack, and the Rust toolchain for development
 
 ## Development
 
 Install dependencies and start the Tauri development app:
 
 ```bash
+corepack enable
 pnpm install
 pnpm tauri dev
 ```
