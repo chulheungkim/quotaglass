@@ -66,7 +66,7 @@ network error does not immediately blank the widget.
 
 - macOS 13 or newer
 - Claude Code and/or Codex authenticated locally
-- Node.js 22.13 or newer, Corepack, and the Rust toolchain for development
+- Node.js 24.18.0 (pinned in `.nvmrc`), Corepack, and the Rust toolchain
 
 ## Development
 
