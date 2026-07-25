@@ -12,6 +12,9 @@
     "tauri": "tauri",
     "ship": "bash scripts/deploy.sh"
   },
+  "engines": {
+    "node": ">=24.18.0"
+  },
   "dependencies": {
     "@tauri-apps/api": "^2",
     "lucide-react": "^1.17.0",
