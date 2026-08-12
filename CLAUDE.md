@@ -32,8 +32,22 @@ Two provider-neutral Tauri commands serve the frontend:
 - `get_provider_stats(provider)` returns summary metrics, 14-day activity,
   per-model breakdown rows, and footer metadata.
 
-Claude uses its local stats cache, session JSONL files, macOS Keychain, and the
-Anthropic OAuth usage endpoint.
+Claude uses its local stats cache, session JSONL files, and the Anthropic OAuth
+usage endpoint. Claude Code stores its OAuth blob in either the macOS Keychain
+(`Claude Code-credentials`) or `$CLAUDE_CONFIG_DIR/.credentials.json`, depending
+on the install — read both and take the token valid longest, or the widget goes
+silently stale when the CLI switches storage.
+
+A successful usage response is authoritative: a window the API omits has no
+usage, so it is dropped rather than backfilled from cache. Only a failed fetch
+falls back to cache, and expired cached windows are discarded instead of shown.
+
+Claude's windows come from the response's self-describing `limits` array —
+`session`, `weekly_all`, and a `weekly_scoped` entry naming a model through
+`scope.model.display_name` (currently Fable). Parse that array, not the legacy
+top-level `seven_day_<model>` fields, which are null for every model now; they
+remain only as a fallback for older responses. A model scoped or retired
+server-side then needs no code change here.
 
 Codex keeps a persistent `codex app-server --stdio` child and calls
 `account/rateLimits/read` plus `account/usage/read`. A cached, metadata-only

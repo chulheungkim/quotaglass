@@ -1,6 +1,6 @@
 [package]
 name = "quotaglass"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI agent usage at a glance"
 authors = ["chulheong"]
 edition = "2021"

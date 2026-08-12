@@ -13,6 +13,7 @@ export interface ProviderLimits {
   windows: ProviderLimit[];
   stale: boolean;
   cachedAt: number | null;
+  staleReason: string | null;
   plan: string | null;
   creditBalance: string | null;
 }
