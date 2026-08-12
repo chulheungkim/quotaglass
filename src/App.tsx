@@ -45,6 +45,13 @@ const COLORS: Record<string, string> = {
 };
 const FALLBACKS = ["#8B6FBF", "#4A90D9", "#4AC9A0", "#D9844A", "#C95A8B"];
 
+// The short rolling window moves continuously while an agent is working, so
+// limits are polled on their own, tighter clock than the local stats scan.
+const LIMITS_POLL_INTERVAL_MS = 60_000;
+// Floor between two non-explicit limit fetches, so bursts of session writes or
+// repeated show/hide never turn into a burst of metered API calls.
+const MIN_LIMITS_INTERVAL_MS = 20_000;
+
 function modelLabel(key: string): string {
   if (NAMES[key]) return NAMES[key];
   return key
@@ -336,6 +343,7 @@ export default function App() {
   const hideTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
+  const limitsFetchedAtRef = useRef(0);
   const isRefreshing = loadingLimits || loadingStats;
   const isSuperCompact = view === "superCompact";
   const isDetailed = view === "detailed";
@@ -363,28 +371,46 @@ export default function App() {
     setView(next);
   }, []);
 
-  const loadLimits = useCallback(async () => {
-    const requestedProvider = provider;
-    setLoadingLimits(true);
-    try {
-      const data = await invoke<ProviderLimits>("get_provider_limits", {
-        provider: requestedProvider,
-      });
-      if (providerRef.current !== requestedProvider) return;
-      setLimits(data);
-      setLimitsErr(null);
-      setRefreshedAt(Date.now());
-      setRefreshedVisible(true);
-      clearTimeout(hideTimerRef.current);
-      hideTimerRef.current = setTimeout(() => setRefreshedVisible(false), 3500);
-    } catch (error) {
-      if (providerRef.current === requestedProvider) {
-        setLimitsErr(String(error));
+  const loadLimits = useCallback(
+    async ({ force = true }: { force?: boolean } = {}) => {
+      const requestedProvider = provider;
+      // Activity- and focus-driven refreshes can arrive in bursts. The usage
+      // endpoints are metered, so anything but an explicit refresh is spaced
+      // out; getting rate limited is what forces the card onto cache.
+      if (
+        !force &&
+        Date.now() - limitsFetchedAtRef.current < MIN_LIMITS_INTERVAL_MS
+      ) {
+        return;
       }
-    } finally {
-      if (providerRef.current === requestedProvider) setLoadingLimits(false);
-    }
-  }, [provider]);
+      limitsFetchedAtRef.current = Date.now();
+      setLoadingLimits(true);
+      try {
+        const data = await invoke<ProviderLimits>("get_provider_limits", {
+          provider: requestedProvider,
+        });
+        if (providerRef.current !== requestedProvider) return;
+        setLimits(data);
+        setLimitsErr(null);
+        // Cached windows carry the time they were captured; showing the clock
+        // at call time would label month-old numbers with the current minute.
+        setRefreshedAt(data.stale ? data.cachedAt : Date.now());
+        setRefreshedVisible(true);
+        clearTimeout(hideTimerRef.current);
+        hideTimerRef.current = setTimeout(
+          () => setRefreshedVisible(false),
+          3500,
+        );
+      } catch (error) {
+        if (providerRef.current === requestedProvider) {
+          setLimitsErr(String(error));
+        }
+      } finally {
+        if (providerRef.current === requestedProvider) setLoadingLimits(false);
+      }
+    },
+    [provider],
+  );
 
   const loadStats = useCallback(async () => {
     const requestedProvider = provider;
@@ -403,7 +429,7 @@ export default function App() {
 
   useEffect(() => {
     loadLimits();
-    const interval = setInterval(loadLimits, 300_000);
+    const interval = setInterval(loadLimits, LIMITS_POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [loadLimits]);
 
@@ -416,12 +442,16 @@ export default function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     listen<ProviderId>("usage-updated", ({ payload }) => {
-      if (payload === providerRef.current) loadStats();
+      if (payload !== providerRef.current) return;
+      loadStats();
+      // Session traffic is what consumes the short rolling window, so the
+      // limits have to follow local activity rather than only the poll clock.
+      loadLimits({ force: false });
     }).then((dispose) => {
       unlisten = dispose;
     });
     return () => unlisten?.();
-  }, [loadStats]);
+  }, [loadLimits, loadStats]);
 
   useEffect(() => {
     return collectAsyncDisposers([
@@ -444,7 +474,7 @@ export default function App() {
       .onFocusChanged(({ payload: focused }) => {
         if (focused) {
           loadStats();
-          loadLimits();
+          loadLimits({ force: false });
         }
       })
       .then((dispose) => {
@@ -659,9 +689,14 @@ export default function App() {
             className={`refreshed-wrapper${refreshedVisible ? " visible" : ""}`}
           >
             <div className="refreshed-inner">
-              <div className="refreshed-at">
+              <div
+                className="refreshed-at"
+                title={limits?.staleReason ?? undefined}
+              >
                 {refreshedAt === null
-                  ? ""
+                  ? limits?.stale
+                    ? `Cached — ${limits.staleReason ?? "live usage unavailable"}`
+                    : ""
                   : `${limits?.stale ? "Cached" : "Refreshed"} ${fmtKST(
                       refreshedAt,
                     )}`}

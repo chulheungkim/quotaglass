@@ -222,6 +222,7 @@ fn parse_limits(
         windows,
         stale,
         cached_at,
+        stale_reason: stale.then(|| "Codex app-server unavailable".to_string()),
         plan,
         credit_balance,
     })

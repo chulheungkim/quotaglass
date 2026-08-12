@@ -27,6 +27,9 @@ pub struct ProviderLimits {
     pub windows: Vec<ProviderLimit>,
     pub stale: bool,
     pub cached_at: Option<u64>,
+    // Why the card is serving cache rather than live data. Without this the
+    // widget can sit on month-old numbers with no way for anyone to tell why.
+    pub stale_reason: Option<String>,
     pub plan: Option<String>,
     pub credit_balance: Option<String>,
 }
@@ -96,6 +99,7 @@ mod tests {
             }],
             stale: false,
             cached_at: None,
+            stale_reason: None,
             plan: Some("plus".into()),
             credit_balance: None,
         };

@@ -2,16 +2,21 @@ use super::{
     ActivityPoint, BreakdownRow, ProviderId, ProviderLimit, ProviderLimits, ProviderStats,
     SummaryMetric,
 };
-use crate::{date_from_secs, now_ms, today_date};
+use crate::{date_from_secs, days_from_civil, now_ms, today_date};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::UNIX_EPOCH,
 };
+
+// The usage endpoint budgets requests per account. When it pushes back we stop
+// calling it for a while instead of retrying on every poll, focus event and
+// manual refresh — retrying through a 429 is what keeps a card pinned to cache.
+const RATE_LIMIT_BACKOFF_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,13 +25,30 @@ struct LimitWindow {
     resets_at: Option<String>,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+impl LimitWindow {
+    // A cached window whose reset time has already passed describes a window
+    // that no longer exists, so it must never be rendered as current usage.
+    fn is_expired(&self, now: u64) -> bool {
+        self.resets_at
+            .as_deref()
+            .and_then(iso_to_epoch_ms)
+            .is_some_and(|resets_at| resets_at <= now)
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CachedLimits {
     five_hour: Option<LimitWindow>,
     seven_day: Option<LimitWindow>,
     seven_day_sonnet: Option<LimitWindow>,
     saved_at: Option<u64>,
+    retry_after: Option<u64>,
+}
+
+struct UsageResponse {
+    status: u32,
+    body: String,
 }
 
 pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
@@ -35,15 +57,92 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
     let cache: CachedLimits = load_json(&cache_path)
         .or_else(|| load_json(&legacy_cache_path))
         .unwrap_or_default();
+
+    if cache.retry_after.is_some_and(|until| now_ms() < until) {
+        return limits_from_cache(&cache, "Usage endpoint rate limited");
+    }
+
     let token = match read_oauth_token() {
         Some(token) => token,
-        None => return limits_from_cache(&cache, "No OAuth token found in keychain"),
+        None => {
+            return limits_from_cache(&cache, "No Claude Code OAuth credentials found");
+        }
     };
+    let response = match fetch_usage(&token) {
+        Ok(response) => response,
+        Err(error) => return limits_from_cache(&cache, &error),
+    };
+    if response.status == 429 {
+        save_json_atomic(
+            &cache_path,
+            &CachedLimits {
+                retry_after: Some(now_ms() + RATE_LIMIT_BACKOFF_MS),
+                ..cache.clone()
+            },
+        );
+        return limits_from_cache(&cache, "Usage endpoint rate limited");
+    }
+    let data: Value = match serde_json::from_str(&response.body) {
+        Ok(data) => data,
+        Err(error) => return limits_from_cache(&cache, &format!("JSON error: {error}")),
+    };
+    // Errors arrive both as `{"type":"error","error":{…}}` and as a bare
+    // `{"error":{…}}` (rate limits and gateway errors use the latter), so key
+    // off the error object itself rather than the optional discriminator.
+    if let Some(message) = api_error_message(&data) {
+        return limits_from_cache(&cache, &message);
+    }
+    if response.status != 200 {
+        return limits_from_cache(&cache, &format!("Usage endpoint HTTP {}", response.status));
+    }
+
+    // The fetch succeeded, so the response is authoritative: a window the API
+    // omits is a window with no usage, not one we failed to read. Merging a
+    // cached window back in here is what used to mark the whole card stale
+    // forever once a single window (Sonnet-only) went quiet.
+    let live = parse_live_windows(&data);
+    save_json_atomic(
+        &cache_path,
+        &CachedLimits {
+            five_hour: live.get("five-hour").cloned(),
+            seven_day: live.get("seven-day").cloned(),
+            seven_day_sonnet: live.get("seven-day-sonnet").cloned(),
+            saved_at: Some(now_ms()),
+            retry_after: None,
+        },
+    );
+    Ok(normalize_limits(
+        live.get("five-hour").cloned(),
+        live.get("seven-day").cloned(),
+        live.get("seven-day-sonnet").cloned(),
+        false,
+        None,
+        None,
+    ))
+}
+
+fn api_error_message(data: &Value) -> Option<String> {
+    let error = data.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Usage unavailable")
+            .to_string(),
+    )
+}
+
+fn fetch_usage(token: &str) -> Result<UsageResponse, String> {
     let output = Command::new("/usr/bin/curl")
         .args([
             "-s",
             "--max-time",
             "8",
+            "-w",
+            "\n%{http_code}",
             "-H",
             &format!("Authorization: Bearer {token}"),
             "-H",
@@ -51,59 +150,15 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
             "https://api.anthropic.com/api/oauth/usage",
         ])
         .output()
-        .map_err(|error| format!("curl error: {error}"));
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => return limits_from_cache(&cache, &error),
-    };
-    let body = match String::from_utf8(output.stdout) {
-        Ok(body) => body,
-        Err(error) => return limits_from_cache(&cache, &format!("UTF-8 error: {error}")),
-    };
-    let data: Value = match serde_json::from_str(&body) {
-        Ok(data) => data,
-        Err(error) => return limits_from_cache(&cache, &format!("JSON error: {error}")),
-    };
-    if data.get("type").and_then(Value::as_str) == Some("error") {
-        let message = data
-            .get("error")
-            .and_then(|error| error.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("Usage unavailable");
-        return limits_from_cache(&cache, message);
-    }
-
-    let live = parse_live_windows(&data);
-    let live_five_hour = live.get("five-hour").cloned();
-    let live_seven_day = live.get("seven-day").cloned();
-    let live_sonnet = live.get("seven-day-sonnet").cloned();
-    let five_hour = live_five_hour.clone().or_else(|| cache.five_hour.clone());
-    let seven_day = live_seven_day.clone().or_else(|| cache.seven_day.clone());
-    let seven_day_sonnet = live_sonnet
-        .clone()
-        .or_else(|| cache.seven_day_sonnet.clone());
-
-    if !live.is_empty() {
-        save_json_atomic(
-            &cache_path,
-            &CachedLimits {
-                five_hour: five_hour.clone(),
-                seven_day: seven_day.clone(),
-                seven_day_sonnet: seven_day_sonnet.clone(),
-                saved_at: Some(now_ms()),
-            },
-        );
-    }
-    let stale = (live_five_hour.is_none() && five_hour.is_some())
-        || (live_seven_day.is_none() && seven_day.is_some())
-        || (live_sonnet.is_none() && seven_day_sonnet.is_some());
-    Ok(normalize_limits(
-        five_hour,
-        seven_day,
-        seven_day_sonnet,
-        stale,
-        if stale { cache.saved_at } else { None },
-    ))
+        .map_err(|error| format!("curl error: {error}"))?;
+    let raw = String::from_utf8(output.stdout).map_err(|error| format!("UTF-8 error: {error}"))?;
+    let (body, status) = raw
+        .rsplit_once('\n')
+        .ok_or_else(|| "Usage endpoint returned no response".to_string())?;
+    Ok(UsageResponse {
+        status: status.trim().parse().unwrap_or(0),
+        body: body.to_string(),
+    })
 }
 
 pub fn get_stats() -> Result<ProviderStats, String> {
@@ -301,6 +356,7 @@ fn normalize_limits(
     seven_day_sonnet: Option<LimitWindow>,
     stale: bool,
     cached_at: Option<u64>,
+    stale_reason: Option<String>,
 ) -> ProviderLimits {
     let mut windows = Vec::new();
     let mut push = |id: &str, title: &str, minutes: i64, window: Option<LimitWindow>| {
@@ -327,26 +383,89 @@ fn normalize_limits(
         windows,
         stale,
         cached_at,
+        stale_reason,
         plan: None,
         credit_balance: None,
     }
 }
 
 fn limits_from_cache(cache: &CachedLimits, error: &str) -> Result<ProviderLimits, String> {
-    if cache.five_hour.is_none() && cache.seven_day.is_none() && cache.seven_day_sonnet.is_none() {
+    // Expired windows are dropped rather than rendered: a five-hour window whose
+    // reset time has passed would otherwise show a long-dead utilization under a
+    // reset time in the past, which reads as live data.
+    let now = now_ms();
+    let keep = |window: &Option<LimitWindow>| {
+        window
+            .clone()
+            .filter(|candidate| !candidate.is_expired(now))
+    };
+    let five_hour = keep(&cache.five_hour);
+    let seven_day = keep(&cache.seven_day);
+    let seven_day_sonnet = keep(&cache.seven_day_sonnet);
+    if five_hour.is_none() && seven_day.is_none() && seven_day_sonnet.is_none() {
         Err(error.to_string())
     } else {
         Ok(normalize_limits(
-            cache.five_hour.clone(),
-            cache.seven_day.clone(),
-            cache.seven_day_sonnet.clone(),
+            five_hour,
+            seven_day,
+            seven_day_sonnet,
             true,
             cache.saved_at,
+            Some(error.to_string()),
         ))
     }
 }
 
+#[derive(Clone)]
+struct OauthToken {
+    access_token: String,
+    expires_at: Option<u64>,
+}
+
+// Claude Code writes the same `claudeAiOauth` blob either into the macOS
+// Keychain or into `<config dir>/.credentials.json`, depending on how the CLI
+// was installed and which storage it last migrated to. Reading only the
+// Keychain silently yields no token the moment the CLI switches to the file,
+// which pins the card to its last cached numbers indefinitely. Read both and
+// keep whichever token is valid for longest.
 fn read_oauth_token() -> Option<String> {
+    let now = now_ms();
+    let mut candidates: Vec<OauthToken> = [token_from_file(), token_from_keychain()]
+        .into_iter()
+        .flatten()
+        .collect();
+    candidates.sort_by_key(|token| std::cmp::Reverse(token.expires_at.unwrap_or(u64::MAX)));
+    candidates
+        .iter()
+        .find(|token| token.expires_at.is_none_or(|expires_at| expires_at > now))
+        // Every token is expired: send the newest anyway so the API reports the
+        // authentication failure instead of the widget guessing at one.
+        .or_else(|| candidates.first())
+        .map(|token| token.access_token.clone())
+}
+
+fn parse_oauth_blob(raw: &str) -> Option<OauthToken> {
+    let credentials: Value = serde_json::from_str(raw.trim()).ok()?;
+    let oauth = credentials.get("claudeAiOauth")?;
+    Some(OauthToken {
+        access_token: oauth.get("accessToken")?.as_str()?.to_string(),
+        expires_at: oauth.get("expiresAt").and_then(Value::as_u64),
+    })
+}
+
+fn credentials_file_path() -> Option<PathBuf> {
+    let directory = std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{}/.claude", std::env::var("HOME").unwrap_or_default()));
+    Some(PathBuf::from(directory).join(".credentials.json"))
+}
+
+fn token_from_file() -> Option<OauthToken> {
+    parse_oauth_blob(&fs::read_to_string(credentials_file_path()?).ok()?)
+}
+
+fn token_from_keychain() -> Option<OauthToken> {
     let username = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string());
     let output = Command::new("/usr/bin/security")
         .args([
@@ -362,13 +481,39 @@ fn read_oauth_token() -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let credentials: Value =
-        serde_json::from_str(String::from_utf8(output.stdout).ok()?.trim()).ok()?;
-    credentials
-        .get("claudeAiOauth")?
-        .get("accessToken")?
-        .as_str()
-        .map(str::to_string)
+    parse_oauth_blob(&String::from_utf8(output.stdout).ok()?)
+}
+
+// Parse the RFC 3339 timestamps the usage endpoint emits — for example
+// "2026-08-11T16:19:59.718872+00:00" or "2026-08-11T16:19:59Z" — into epoch
+// milliseconds, so cached windows can be checked for expiry without pulling in
+// a date library.
+fn iso_to_epoch_ms(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    let hour = number(11..13)?;
+    let minute = number(14..16)?;
+    let second = number(17..19)?;
+    let offset_minutes = match value[19..].find(['+', '-']) {
+        Some(index) => {
+            let offset = &value[19 + index..];
+            if offset.len() < 6 {
+                return None;
+            }
+            let sign = if offset.starts_with('-') { -1 } else { 1 };
+            sign * (offset[1..3].parse::<i64>().ok()? * 60 + offset[4..6].parse::<i64>().ok()?)
+        }
+        None => 0,
+    };
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+        - offset_minutes * 60;
+    u64::try_from(seconds.checked_mul(1_000)?).ok()
 }
 
 fn file_mtime_date(path: &Path) -> Option<String> {
@@ -486,9 +631,148 @@ mod tests {
             live.get("seven-day-sonnet").cloned(),
             false,
             None,
+            None,
         );
         assert_eq!(normalized.windows.len(), 3);
         assert_eq!(normalized.windows[0].id, "five-hour");
         assert_eq!(normalized.windows[2].title, "Current week (Sonnet only)");
+    }
+
+    #[test]
+    fn a_missing_live_window_does_not_mark_the_card_stale() {
+        // The API omits a window that has no usage. That is live data, not a
+        // failed read, so the remaining windows must still render as fresh.
+        let data = serde_json::json!({
+            "five_hour": {"utilization": 4.0, "resets_at": "2026-08-12T05:00:00+00:00"},
+            "seven_day": {"utilization": 18.0, "resets_at": "2026-08-17T14:59:59+00:00"},
+            "seven_day_sonnet": Value::Null
+        });
+        let live = parse_live_windows(&data);
+        assert_eq!(live.len(), 2);
+        let normalized = normalize_limits(
+            live.get("five-hour").cloned(),
+            live.get("seven-day").cloned(),
+            live.get("seven-day-sonnet").cloned(),
+            false,
+            None,
+            None,
+        );
+        assert!(!normalized.stale);
+        assert_eq!(normalized.windows.len(), 2);
+    }
+
+    #[test]
+    fn rate_limit_and_bare_error_bodies_are_detected() {
+        let bare = serde_json::json!({
+            "error": {"type": "rate_limit_error", "message": "Rate limited. Please try again later."}
+        });
+        let discriminated = serde_json::json!({
+            "type": "error",
+            "error": {"type": "authentication_error", "message": "invalid bearer token"}
+        });
+        assert_eq!(
+            api_error_message(&bare).as_deref(),
+            Some("Rate limited. Please try again later.")
+        );
+        assert_eq!(
+            api_error_message(&discriminated).as_deref(),
+            Some("invalid bearer token")
+        );
+        assert_eq!(
+            api_error_message(&serde_json::json!({"five_hour": null})),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_cached_windows_are_dropped_instead_of_rendered() {
+        let cache = CachedLimits {
+            five_hour: Some(LimitWindow {
+                utilization: Some(0.0),
+                resets_at: Some("2026-08-11T16:19:59.718872+00:00".to_string()),
+            }),
+            seven_day: Some(LimitWindow {
+                utilization: Some(18.0),
+                resets_at: Some("2099-01-01T00:00:00+00:00".to_string()),
+            }),
+            seven_day_sonnet: None,
+            saved_at: Some(1_786_450_354_868),
+            retry_after: None,
+        };
+        let limits = limits_from_cache(&cache, "No Claude Code OAuth credentials found").unwrap();
+        assert!(limits.stale);
+        assert_eq!(limits.cached_at, Some(1_786_450_354_868));
+        assert_eq!(
+            limits.stale_reason.as_deref(),
+            Some("No Claude Code OAuth credentials found")
+        );
+        assert_eq!(limits.windows.len(), 1);
+        assert_eq!(limits.windows[0].id, "seven-day");
+    }
+
+    #[test]
+    fn an_entirely_expired_cache_surfaces_the_error() {
+        let cache = CachedLimits {
+            five_hour: Some(LimitWindow {
+                utilization: Some(0.0),
+                resets_at: Some("2026-08-11T16:19:59+00:00".to_string()),
+            }),
+            ..CachedLimits::default()
+        };
+        assert_eq!(
+            limits_from_cache(&cache, "boom").unwrap_err(),
+            "boom".to_string()
+        );
+    }
+
+    #[test]
+    fn parses_the_timestamp_forms_the_usage_endpoint_emits() {
+        assert_eq!(iso_to_epoch_ms("1970-01-01T00:00:00+00:00"), Some(0),);
+        assert_eq!(
+            iso_to_epoch_ms("2026-08-11T16:19:59.718872+00:00"),
+            Some(1_786_465_199_000),
+        );
+        // Z and an explicit offset must resolve to the same instant.
+        assert_eq!(
+            iso_to_epoch_ms("2026-08-11T16:19:59Z"),
+            iso_to_epoch_ms("2026-08-12T01:19:59+09:00"),
+        );
+        assert_eq!(iso_to_epoch_ms("not a timestamp"), None);
+    }
+
+    // Opt-in check against the machine's real Claude Code install: proves the
+    // credential lookup still finds a token wherever the CLI is storing it, and
+    // that the endpoint answers with live windows rather than a cache fallback.
+    #[test]
+    #[ignore = "requires a locally installed and authenticated Claude Code CLI"]
+    fn live_claude_usage_endpoint_responds() {
+        assert!(
+            read_oauth_token().is_some(),
+            "no Claude Code OAuth credentials found in the keychain or config dir"
+        );
+        let support = std::env::temp_dir().join(format!("quotaglass-live-{}", now_ms()));
+        let limits = get_limits(&support).expect("live usage fetch should succeed");
+        let _ = fs::remove_dir_all(&support);
+        println!(
+            "stale={} reason={:?} windows={:?}",
+            limits.stale,
+            limits.stale_reason,
+            limits
+                .windows
+                .iter()
+                .map(|window| (&window.id, window.utilization, &window.resets_at))
+                .collect::<Vec<_>>()
+        );
+        assert!(!limits.stale, "expected live data, got cache fallback");
+        assert!(!limits.windows.is_empty(), "expected at least one window");
+    }
+
+    #[test]
+    fn oauth_blobs_from_either_storage_parse_identically() {
+        let blob = r#"{"claudeAiOauth":{"accessToken":"sk-test","refreshToken":"rt","expiresAt":1786551599000,"scopes":["user:inference"]}}"#;
+        let token = parse_oauth_blob(blob).expect("blob should parse");
+        assert_eq!(token.access_token, "sk-test");
+        assert_eq!(token.expires_at, Some(1_786_551_599_000));
+        assert!(parse_oauth_blob("{}").is_none());
     }
 }
