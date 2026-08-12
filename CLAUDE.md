@@ -42,6 +42,13 @@ A successful usage response is authoritative: a window the API omits has no
 usage, so it is dropped rather than backfilled from cache. Only a failed fetch
 falls back to cache, and expired cached windows are discarded instead of shown.
 
+Claude's windows come from the response's self-describing `limits` array —
+`session`, `weekly_all`, and a `weekly_scoped` entry naming a model through
+`scope.model.display_name` (currently Fable). Parse that array, not the legacy
+top-level `seven_day_<model>` fields, which are null for every model now; they
+remain only as a fallback for older responses. A model scoped or retired
+server-side then needs no code change here.
+
 Codex keeps a persistent `codex app-server --stdio` child and calls
 `account/rateLimits/read` plus `account/usage/read`. A cached, metadata-only
 scan of local Codex session JSONL files supplies session, prompt, tool, and
