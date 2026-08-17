@@ -1,6 +1,6 @@
 use super::{
     ActivityPoint, BreakdownRow, ProviderId, ProviderLimit, ProviderLimits, ProviderStats,
-    SummaryMetric,
+    StaleKind, SummaryMetric,
 };
 use crate::{date_from_secs, days_from_civil, now_ms, today_date};
 use serde::{Deserialize, Serialize};
@@ -94,18 +94,33 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
         .unwrap_or_default();
 
     if cache.retry_after.is_some_and(|until| now_ms() < until) {
-        return limits_from_cache(&cache, "Usage endpoint rate limited");
+        return limits_from_cache(
+            &cache,
+            "Usage endpoint rate limited",
+            StaleKind::RateLimited,
+        );
     }
 
     let token = match read_oauth_token() {
         Some(token) => token,
         None => {
-            return limits_from_cache(&cache, "No Claude Code OAuth credentials found");
+            return limits_from_cache(
+                &cache,
+                "No Claude Code OAuth credentials found",
+                StaleKind::NotSignedIn,
+            );
         }
     };
-    let response = match fetch_usage(&token) {
+    // Whether the token was already dead before we sent it. The request goes out
+    // either way so the API stays authoritative, but knowing this up front is
+    // what lets a rejection be reported as an expired token rather than as an
+    // opaque authentication error the user can do nothing with.
+    let token_expired = token_is_expired(&token, now_ms());
+    let rejected = rejection_kind(token_expired, false);
+
+    let response = match fetch_usage(&token.access_token) {
         Ok(response) => response,
-        Err(error) => return limits_from_cache(&cache, &error),
+        Err(error) => return limits_from_cache(&cache, &error, StaleKind::Unreachable),
     };
     if response.status == 429 {
         save_json_atomic(
@@ -115,20 +130,31 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
                 ..cache.clone()
             },
         );
-        return limits_from_cache(&cache, "Usage endpoint rate limited");
+        return limits_from_cache(
+            &cache,
+            "Usage endpoint rate limited",
+            StaleKind::RateLimited,
+        );
     }
     let data: Value = match serde_json::from_str(&response.body) {
         Ok(data) => data,
-        Err(error) => return limits_from_cache(&cache, &format!("JSON error: {error}")),
+        Err(error) => {
+            return limits_from_cache(&cache, &format!("JSON error: {error}"), StaleKind::Unknown)
+        }
     };
     // Errors arrive both as `{"type":"error","error":{…}}` and as a bare
     // `{"error":{…}}` (rate limits and gateway errors use the latter), so key
     // off the error object itself rather than the optional discriminator.
-    if let Some(message) = api_error_message(&data) {
-        return limits_from_cache(&cache, &message);
+    if let Some(error) = api_error(&data) {
+        let kind = rejection_kind(token_expired, error.is_rate_limit);
+        return limits_from_cache(&cache, &error.message, kind);
     }
     if response.status != 200 {
-        return limits_from_cache(&cache, &format!("Usage endpoint HTTP {}", response.status));
+        return limits_from_cache(
+            &cache,
+            &format!("Usage endpoint HTTP {}", response.status),
+            rejected,
+        );
     }
 
     // The fetch succeeded, so the response is authoritative: a window the API
@@ -152,23 +178,52 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
         stale: false,
         cached_at: None,
         stale_reason: None,
+        stale_kind: None,
         plan: None,
         credit_balance: None,
     })
 }
 
-fn api_error_message(data: &Value) -> Option<String> {
+struct ApiError {
+    message: String,
+    is_rate_limit: bool,
+}
+
+fn token_is_expired(token: &OauthToken, now: u64) -> bool {
+    token.expires_at.is_some_and(|expires_at| expires_at <= now)
+}
+
+// How to describe a request the endpoint refused. A rate limit outranks an
+// expired token: when both are true, backing off is still the right advice, and
+// telling the user to go renew a token would send them after the wrong problem.
+fn rejection_kind(token_expired: bool, is_rate_limit: bool) -> StaleKind {
+    if is_rate_limit {
+        StaleKind::RateLimited
+    } else if token_expired {
+        StaleKind::TokenExpired
+    } else {
+        StaleKind::Unknown
+    }
+}
+
+fn api_error(data: &Value) -> Option<ApiError> {
     let error = data.get("error")?;
     if error.is_null() {
         return None;
     }
-    Some(
-        error
+    // Match on the machine-readable discriminator, not the prose.
+    let is_rate_limit = error
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.contains("rate_limit"));
+    Some(ApiError {
+        is_rate_limit,
+        message: error
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("Usage unavailable")
             .to_string(),
-    )
+    })
 }
 
 fn fetch_usage(token: &str) -> Result<UsageResponse, String> {
@@ -475,7 +530,11 @@ fn parse_legacy_windows(data: &Value) -> Vec<ProviderLimit> {
     .collect()
 }
 
-fn limits_from_cache(cache: &CachedLimits, error: &str) -> Result<ProviderLimits, String> {
+fn limits_from_cache(
+    cache: &CachedLimits,
+    error: &str,
+    kind: StaleKind,
+) -> Result<ProviderLimits, String> {
     // Expired windows are dropped rather than rendered: a five-hour window whose
     // reset time has passed would otherwise show a long-dead utilization under a
     // reset time in the past, which reads as live data.
@@ -494,6 +553,7 @@ fn limits_from_cache(cache: &CachedLimits, error: &str) -> Result<ProviderLimits
         stale: true,
         cached_at: cache.saved_at,
         stale_reason: Some(error.to_string()),
+        stale_kind: Some(kind),
         plan: None,
         credit_balance: None,
     })
@@ -511,7 +571,7 @@ struct OauthToken {
 // Keychain silently yields no token the moment the CLI switches to the file,
 // which pins the card to its last cached numbers indefinitely. Read both and
 // keep whichever token is valid for longest.
-fn read_oauth_token() -> Option<String> {
+fn read_oauth_token() -> Option<OauthToken> {
     let now = now_ms();
     let mut candidates: Vec<OauthToken> = [token_from_file(), token_from_keychain()]
         .into_iter()
@@ -522,9 +582,10 @@ fn read_oauth_token() -> Option<String> {
         .iter()
         .find(|token| token.expires_at.is_none_or(|expires_at| expires_at > now))
         // Every token is expired: send the newest anyway so the API reports the
-        // authentication failure instead of the widget guessing at one.
+        // authentication failure instead of the widget guessing at one. The
+        // caller reads `expires_at` to tell that case apart afterwards.
         .or_else(|| candidates.first())
-        .map(|token| token.access_token.clone())
+        .cloned()
 }
 
 fn parse_oauth_blob(raw: &str) -> Option<OauthToken> {
@@ -788,18 +849,16 @@ mod tests {
             "type": "error",
             "error": {"type": "authentication_error", "message": "invalid bearer token"}
         });
-        assert_eq!(
-            api_error_message(&bare).as_deref(),
-            Some("Rate limited. Please try again later.")
-        );
-        assert_eq!(
-            api_error_message(&discriminated).as_deref(),
-            Some("invalid bearer token")
-        );
-        assert_eq!(
-            api_error_message(&serde_json::json!({"five_hour": null})),
-            None
-        );
+        let bare = api_error(&bare).expect("bare error body should be detected");
+        assert_eq!(bare.message, "Rate limited. Please try again later.");
+        // Classified from `type`, so a reworded message still backs off.
+        assert!(bare.is_rate_limit);
+
+        let discriminated = api_error(&discriminated).expect("error body should be detected");
+        assert_eq!(discriminated.message, "invalid bearer token");
+        assert!(!discriminated.is_rate_limit);
+
+        assert!(api_error(&serde_json::json!({"five_hour": null})).is_none());
     }
 
     fn cached_window(id: &str, resets_at: &str) -> ProviderLimit {
@@ -822,13 +881,19 @@ mod tests {
             saved_at: Some(1_786_450_354_868),
             ..CachedLimits::default()
         };
-        let limits = limits_from_cache(&cache, "No Claude Code OAuth credentials found").unwrap();
+        let limits = limits_from_cache(
+            &cache,
+            "No Claude Code OAuth credentials found",
+            StaleKind::NotSignedIn,
+        )
+        .unwrap();
         assert!(limits.stale);
         assert_eq!(limits.cached_at, Some(1_786_450_354_868));
         assert_eq!(
             limits.stale_reason.as_deref(),
             Some("No Claude Code OAuth credentials found")
         );
+        assert_eq!(limits.stale_kind, Some(StaleKind::NotSignedIn));
         assert_eq!(limits.windows.len(), 1);
         assert_eq!(limits.windows[0].id, "seven-day");
     }
@@ -840,7 +905,7 @@ mod tests {
             ..CachedLimits::default()
         };
         assert_eq!(
-            limits_from_cache(&cache, "boom").unwrap_err(),
+            limits_from_cache(&cache, "boom", StaleKind::Unknown).unwrap_err(),
             "boom".to_string()
         );
     }
@@ -853,7 +918,7 @@ mod tests {
             "sevenDaySonnet":{"utilization":1.0,"resetsAt":"2026-07-06T14:59:59+00:00"},
             "savedAt":1786450354868}"#;
         let cache: CachedLimits = serde_json::from_str(legacy).expect("legacy cache should parse");
-        let limits = limits_from_cache(&cache, "offline").unwrap();
+        let limits = limits_from_cache(&cache, "offline", StaleKind::Unreachable).unwrap();
         let ids: Vec<_> = limits.windows.iter().map(|w| w.id.as_str()).collect();
         // The retired Sonnet window is not carried forward.
         assert_eq!(ids, ["five-hour", "seven-day"]);
@@ -888,8 +953,9 @@ mod tests {
         let limits = get_limits(&support).expect("live usage fetch should succeed");
         let _ = fs::remove_dir_all(&support);
         println!(
-            "stale={} reason={:?} windows={:?}",
+            "stale={} kind={:?} reason={:?} windows={:?}",
             limits.stale,
+            limits.stale_kind,
             limits.stale_reason,
             limits
                 .windows
@@ -899,6 +965,39 @@ mod tests {
         );
         assert!(!limits.stale, "expected live data, got cache fallback");
         assert!(!limits.windows.is_empty(), "expected at least one window");
+    }
+
+    #[test]
+    fn an_expired_token_is_reported_as_expired_not_as_an_opaque_error() {
+        let expired = OauthToken {
+            access_token: "sk-test".to_string(),
+            expires_at: Some(1_000),
+        };
+        let live = OauthToken {
+            access_token: "sk-test".to_string(),
+            expires_at: Some(3_000),
+        };
+        // A token with no stated expiry cannot be assumed dead.
+        let unknown = OauthToken {
+            access_token: "sk-test".to_string(),
+            expires_at: None,
+        };
+        assert!(token_is_expired(&expired, 2_000));
+        assert!(!token_is_expired(&live, 2_000));
+        assert!(!token_is_expired(&unknown, 2_000));
+        // Expiry is inclusive: a token expiring exactly now is already useless.
+        assert!(token_is_expired(&live, 3_000));
+
+        assert_eq!(rejection_kind(true, false), StaleKind::TokenExpired);
+        assert_eq!(rejection_kind(false, false), StaleKind::Unknown);
+    }
+
+    #[test]
+    fn a_rate_limit_outranks_an_expired_token() {
+        // Both true at once would otherwise send the user to renew a token when
+        // the actual instruction is to wait.
+        assert_eq!(rejection_kind(true, true), StaleKind::RateLimited);
+        assert_eq!(rejection_kind(false, true), StaleKind::RateLimited);
     }
 
     #[test]

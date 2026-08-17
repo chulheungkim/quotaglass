@@ -8,12 +8,21 @@ export interface ProviderLimit {
   windowMinutes: number | null;
 }
 
+/** Mirrors `StaleKind` in src-tauri/src/providers/mod.rs. */
+export type StaleKind =
+  | "tokenExpired"
+  | "notSignedIn"
+  | "rateLimited"
+  | "unreachable"
+  | "unknown";
+
 export interface ProviderLimits {
   provider: ProviderId;
   windows: ProviderLimit[];
   stale: boolean;
   cachedAt: number | null;
   staleReason: string | null;
+  staleKind: StaleKind | null;
   plan: string | null;
   creditBalance: string | null;
 }
