@@ -10,7 +10,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::UNIX_EPOCH,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 // The usage endpoint budgets requests per account. When it pushes back we stop
@@ -22,6 +23,11 @@ const RATE_LIMIT_BACKOFF_MS: u64 = 10 * 60 * 1000;
 // One attempt per interval is enough: a token the CLI declined to renew will
 // keep being declined until the user signs in again.
 const RENEWAL_INTERVAL_MS: u64 = 10 * 60 * 1000;
+
+// Generous next to the ~1s `doctor` actually takes, because the point is to
+// bound a hang, not to race a slow machine.
+const RENEWAL_TIMEOUT: Duration = Duration::from_secs(30);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +94,19 @@ impl CachedLimits {
         })
         .collect()
     }
+
+    // Base for a write that updates one field and keeps the rest. The legacy
+    // fields are `skip_serializing`, so `..cache.clone()` would persist a
+    // legacy-shaped cache as an empty window list and destroy the very numbers
+    // the card falls back to. Materialise them into the current shape instead.
+    fn preserving(&self) -> Self {
+        CachedLimits {
+            windows: self.windows(),
+            five_hour: None,
+            seven_day: None,
+            ..self.clone()
+        }
+    }
 }
 
 struct UsageResponse {
@@ -126,7 +145,7 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
     // asking the CLI to renew and trying again. Every other failure would fail
     // identically on a retry, so only this one is worth a second request.
     if matches!(&attempt, Err(failure) if failure.kind == StaleKind::TokenExpired)
-        && may_renew(&cache, now_ms())
+        && claim_renewal_slot(&cache, now_ms())
     {
         // Recorded before the attempt, not after: a renewal that hangs or dies
         // must still count against the interval, or a broken CLI gets spawned
@@ -135,7 +154,7 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
             &cache_path,
             &CachedLimits {
                 renewal_attempted_at: Some(now_ms()),
-                ..cache.clone()
+                ..cache.preserving()
             },
         );
         if let Some(renewed) = renew_token_via_cli(&token) {
@@ -183,7 +202,7 @@ fn fetch_windows(
             cache_path,
             &CachedLimits {
                 retry_after: Some(now_ms() + RATE_LIMIT_BACKOFF_MS),
-                ..cache.clone()
+                ..cache.preserving()
             },
         );
         return Err(FetchFailure {
@@ -236,6 +255,27 @@ fn may_renew(cache: &CachedLimits, now: u64) -> bool {
         .is_none_or(|at| now.saturating_sub(at) >= RENEWAL_INTERVAL_MS)
 }
 
+// The on-disk marker alone cannot arbitrate between two overlapping polls: both
+// load the cache, both spend seconds in `fetch_usage`, and both would still see
+// an unclaimed slot afterwards. Every caller is in this one process, so claim
+// the slot atomically here; the marker's job is to carry the interval across
+// restarts, not to serialise concurrent callers.
+static LAST_RENEWAL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn claim_renewal_slot(cache: &CachedLimits, now: u64) -> bool {
+    if !may_renew(cache, now) {
+        return false;
+    }
+    let last = LAST_RENEWAL_MS.load(Ordering::Acquire);
+    if now.saturating_sub(last) < RENEWAL_INTERVAL_MS {
+        return false;
+    }
+    // Only the caller that wins the exchange spawns the CLI.
+    LAST_RENEWAL_MS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 // Claude Code renews and stores its own OAuth token as a side effect of
 // `doctor`. Delegating to it keeps the refresh token, its rotation and the
 // write-back entirely inside the CLI, so the widget can never desynchronise the
@@ -247,7 +287,7 @@ fn may_renew(cache: &CachedLimits, now: u64) -> bool {
 // forward, no retry happens and the card falls back to cache as before.
 fn renew_token_via_cli(previous: &OauthToken) -> Option<OauthToken> {
     let binary = claude_binary_path()?;
-    let status = Command::new(binary)
+    let mut child = Command::new(binary)
         .arg("doctor")
         // The widget is a background agent with none of the user's shell
         // environment, so without this an update check could decide to pull a
@@ -256,13 +296,36 @@ fn renew_token_via_cli(previous: &OauthToken) -> Option<OauthToken> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .ok()?;
-    if !status.success() {
+    if !wait_or_kill(&mut child, RENEWAL_TIMEOUT) {
         return None;
     }
     let renewed = read_oauth_token()?;
     (renewed.expires_at > previous.expires_at).then_some(renewed)
+}
+
+// `Command::status` blocks forever, and this call runs on a Tauri blocking-pool
+// thread. `doctor` makes network calls, so on a blackholed or captive-portal
+// network an unbounded wait would strand both the thread and the child process.
+// Every other subprocess here is bounded (curl uses `--max-time`); this is that
+// bound. Returns whether the process exited successfully within the timeout.
+fn wait_or_kill(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            // Reap it, or the killed child lingers as a zombie.
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 // `LSUIElement` background agents inherit none of the user's shell PATH, so the
@@ -1115,6 +1178,49 @@ mod tests {
         // A timestamp from the future (a clock moved backwards) must not
         // underflow into permitting every poll.
         assert!(!may_renew(&just_tried, 5_000_000));
+    }
+
+    #[test]
+    fn a_partial_write_does_not_destroy_a_legacy_shaped_cache() {
+        // The legacy fields are `skip_serializing`, so a partial write built on
+        // a bare clone would persist as an empty window list and turn a card
+        // that could still show its last numbers into a hard error.
+        let legacy = r#"{"fiveHour":{"utilization":4.0,"resetsAt":"2099-01-01T00:00:00+00:00"},
+            "sevenDay":{"utilization":18.0,"resetsAt":"2099-01-01T00:00:00+00:00"},
+            "savedAt":1786450354868}"#;
+        let cache: CachedLimits = serde_json::from_str(legacy).expect("legacy cache should parse");
+        assert!(cache.windows.is_empty(), "legacy cache has no window list");
+
+        let written = CachedLimits {
+            renewal_attempted_at: Some(1_786_450_354_868),
+            ..cache.preserving()
+        };
+        let round_tripped: CachedLimits =
+            serde_json::from_str(&serde_json::to_string(&written).expect("should serialize"))
+                .expect("should parse");
+
+        let ids: Vec<_> = round_tripped
+            .windows()
+            .iter()
+            .map(|window| window.id.clone())
+            .collect();
+        assert_eq!(ids, ["five-hour", "seven-day"]);
+        assert_eq!(round_tripped.saved_at, Some(1_786_450_354_868));
+        assert_eq!(round_tripped.renewal_attempted_at, Some(1_786_450_354_868));
+    }
+
+    #[test]
+    fn only_one_of_two_overlapping_callers_claims_the_renewal_slot() {
+        let cache = CachedLimits::default();
+        // Both callers loaded the cache before either wrote a marker, so the
+        // on-disk field cannot arbitrate between them.
+        let now = LAST_RENEWAL_MS.load(Ordering::Acquire) + RENEWAL_INTERVAL_MS + 1;
+        assert!(may_renew(&cache, now), "on-disk check permits both");
+        assert!(claim_renewal_slot(&cache, now));
+        assert!(!claim_renewal_slot(&cache, now), "second caller is refused");
+        // The interval still applies once the slot is claimed.
+        assert!(!claim_renewal_slot(&cache, now + RENEWAL_INTERVAL_MS - 1));
+        assert!(claim_renewal_slot(&cache, now + RENEWAL_INTERVAL_MS));
     }
 
     #[test]

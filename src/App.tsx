@@ -107,11 +107,20 @@ const STALE_CAUSE: Record<StaleKind, string> = {
 // The one failure the user can actually clear, so it states the remedy and drops
 // the timestamp — that number is what makes a multi-hour outage look fresh, and
 // the room it frees is what the remedy needs.
+// `kind` is whatever Rust serialized, asserted to the union rather than
+// validated, so a variant added there and not mirrored here must not reach the
+// user as the string "undefined".
+function staleCause(kind: StaleKind | null): string {
+  return kind !== null && kind in STALE_CAUSE
+    ? STALE_CAUSE[kind]
+    : STALE_CAUSE.unknown;
+}
+
 function staleFooter(kind: StaleKind | null, cachedAt: number | null): string {
   if (kind === "tokenExpired") {
     return "Cached — token expired, open Claude Code";
   }
-  const cause = STALE_CAUSE[kind ?? "unknown"];
+  const cause = staleCause(kind);
   return cachedAt === null
     ? `Cached — ${cause}`
     : `Cached ${fmtKST(cachedAt)} — ${cause}`;
