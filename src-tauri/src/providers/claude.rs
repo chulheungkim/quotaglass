@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     time::UNIX_EPOCH,
 };
 
@@ -17,6 +17,11 @@ use std::{
 // calling it for a while instead of retrying on every poll, focus event and
 // manual refresh — retrying through a 429 is what keeps a card pinned to cache.
 const RATE_LIMIT_BACKOFF_MS: u64 = 10 * 60 * 1000;
+
+// Renewal spawns the full Claude Code binary, so it must not run on every poll.
+// One attempt per interval is enough: a token the CLI declined to renew will
+// keep being declined until the user signs in again.
+const RENEWAL_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +49,10 @@ struct CachedLimits {
     windows: Vec<ProviderLimit>,
     saved_at: Option<u64>,
     retry_after: Option<u64>,
+    // When renewal was last asked of the CLI, so a failing renewal cannot spawn
+    // the binary once a minute forever.
+    #[serde(default)]
+    renewal_attempted_at: Option<u64>,
     // Shape written before the endpoint exposed model-scoped windows. Read so
     // an upgrade with no network still has something to show; never written.
     #[serde(default, skip_serializing)]
@@ -111,50 +120,95 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
             );
         }
     };
+    let mut attempt = fetch_windows(&token, &cache_path, &cache);
+
+    // An expired token is the one failure the widget can clear by itself, by
+    // asking the CLI to renew and trying again. Every other failure would fail
+    // identically on a retry, so only this one is worth a second request.
+    if matches!(&attempt, Err(failure) if failure.kind == StaleKind::TokenExpired)
+        && may_renew(&cache, now_ms())
+    {
+        // Recorded before the attempt, not after: a renewal that hangs or dies
+        // must still count against the interval, or a broken CLI gets spawned
+        // on every poll.
+        save_json_atomic(
+            &cache_path,
+            &CachedLimits {
+                renewal_attempted_at: Some(now_ms()),
+                ..cache.clone()
+            },
+        );
+        if let Some(renewed) = renew_token_via_cli(&token) {
+            attempt = fetch_windows(&renewed, &cache_path, &cache);
+        }
+    }
+
+    match attempt {
+        Ok(windows) => Ok(ProviderLimits {
+            provider: ProviderId::Claude,
+            windows,
+            stale: false,
+            cached_at: None,
+            stale_reason: None,
+            stale_kind: None,
+            plan: None,
+            credit_balance: None,
+        }),
+        Err(failure) => limits_from_cache(&cache, &failure.message, failure.kind),
+    }
+}
+
+struct FetchFailure {
+    message: String,
+    kind: StaleKind,
+}
+
+fn fetch_windows(
+    token: &OauthToken,
+    cache_path: &Path,
+    cache: &CachedLimits,
+) -> Result<Vec<ProviderLimit>, FetchFailure> {
     // Whether the token was already dead before we sent it. The request goes out
     // either way so the API stays authoritative, but knowing this up front is
     // what lets a rejection be reported as an expired token rather than as an
     // opaque authentication error the user can do nothing with.
-    let token_expired = token_is_expired(&token, now_ms());
-    let rejected = rejection_kind(token_expired, false);
+    let token_expired = token_is_expired(token, now_ms());
 
-    let response = match fetch_usage(&token.access_token) {
-        Ok(response) => response,
-        Err(error) => return limits_from_cache(&cache, &error, StaleKind::Unreachable),
-    };
+    let response = fetch_usage(&token.access_token).map_err(|error| FetchFailure {
+        message: error,
+        kind: StaleKind::Unreachable,
+    })?;
     if response.status == 429 {
         save_json_atomic(
-            &cache_path,
+            cache_path,
             &CachedLimits {
                 retry_after: Some(now_ms() + RATE_LIMIT_BACKOFF_MS),
                 ..cache.clone()
             },
         );
-        return limits_from_cache(
-            &cache,
-            "Usage endpoint rate limited",
-            StaleKind::RateLimited,
-        );
+        return Err(FetchFailure {
+            message: "Usage endpoint rate limited".to_string(),
+            kind: StaleKind::RateLimited,
+        });
     }
-    let data: Value = match serde_json::from_str(&response.body) {
-        Ok(data) => data,
-        Err(error) => {
-            return limits_from_cache(&cache, &format!("JSON error: {error}"), StaleKind::Unknown)
-        }
-    };
+    let data: Value = serde_json::from_str(&response.body).map_err(|error| FetchFailure {
+        message: format!("JSON error: {error}"),
+        kind: StaleKind::Unknown,
+    })?;
     // Errors arrive both as `{"type":"error","error":{…}}` and as a bare
     // `{"error":{…}}` (rate limits and gateway errors use the latter), so key
     // off the error object itself rather than the optional discriminator.
     if let Some(error) = api_error(&data) {
-        let kind = rejection_kind(token_expired, error.is_rate_limit);
-        return limits_from_cache(&cache, &error.message, kind);
+        return Err(FetchFailure {
+            message: error.message,
+            kind: rejection_kind(token_expired, error.is_rate_limit),
+        });
     }
     if response.status != 200 {
-        return limits_from_cache(
-            &cache,
-            &format!("Usage endpoint HTTP {}", response.status),
-            rejected,
-        );
+        return Err(FetchFailure {
+            message: format!("Usage endpoint HTTP {}", response.status),
+            kind: rejection_kind(token_expired, false),
+        });
     }
 
     // The fetch succeeded, so the response is authoritative: a window the API
@@ -163,25 +217,66 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
     // forever once a single window (Sonnet-only) went quiet.
     let live = parse_live_windows(&data);
     save_json_atomic(
-        &cache_path,
+        cache_path,
         &CachedLimits {
             windows: live.clone(),
             saved_at: Some(now_ms()),
             retry_after: None,
+            renewal_attempted_at: None,
             five_hour: None,
             seven_day: None,
         },
     );
-    Ok(ProviderLimits {
-        provider: ProviderId::Claude,
-        windows: live,
-        stale: false,
-        cached_at: None,
-        stale_reason: None,
-        stale_kind: None,
-        plan: None,
-        credit_balance: None,
-    })
+    Ok(live)
+}
+
+fn may_renew(cache: &CachedLimits, now: u64) -> bool {
+    cache
+        .renewal_attempted_at
+        .is_none_or(|at| now.saturating_sub(at) >= RENEWAL_INTERVAL_MS)
+}
+
+// Claude Code renews and stores its own OAuth token as a side effect of
+// `doctor`. Delegating to it keeps the refresh token, its rotation and the
+// write-back entirely inside the CLI, so the widget can never desynchronise the
+// store and log the user out — which is exactly what performing the OAuth
+// refresh here would risk.
+//
+// This is an undocumented side effect and a future release may drop it, so it
+// is verified rather than assumed: unless the stored expiry actually moved
+// forward, no retry happens and the card falls back to cache as before.
+fn renew_token_via_cli(previous: &OauthToken) -> Option<OauthToken> {
+    let binary = claude_binary_path()?;
+    let status = Command::new(binary)
+        .arg("doctor")
+        // The widget is a background agent with none of the user's shell
+        // environment, so without this an update check could decide to pull a
+        // release in the background on a poll the user never asked for.
+        .env("DISABLE_AUTOUPDATER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let renewed = read_oauth_token()?;
+    (renewed.expires_at > previous.expires_at).then_some(renewed)
+}
+
+// `LSUIElement` background agents inherit none of the user's shell PATH, so the
+// CLI has to be found where it actually installs rather than through `which`.
+fn claude_binary_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    [
+        format!("{home}/.local/bin/claude"),
+        "/usr/local/bin/claude".to_string(),
+        "/opt/homebrew/bin/claude".to_string(),
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
 }
 
 struct ApiError {
@@ -998,6 +1093,37 @@ mod tests {
         // the actual instruction is to wait.
         assert_eq!(rejection_kind(true, true), StaleKind::RateLimited);
         assert_eq!(rejection_kind(false, true), StaleKind::RateLimited);
+    }
+
+    #[test]
+    fn renewal_is_throttled_so_a_failing_cli_is_not_spawned_every_poll() {
+        let never_tried = CachedLimits::default();
+        assert!(may_renew(&never_tried, 10_000_000));
+
+        let just_tried = CachedLimits {
+            renewal_attempted_at: Some(10_000_000),
+            ..CachedLimits::default()
+        };
+        assert!(!may_renew(&just_tried, 10_000_000));
+        // One millisecond short of the interval still counts as too soon.
+        assert!(!may_renew(
+            &just_tried,
+            10_000_000 + RENEWAL_INTERVAL_MS - 1
+        ));
+        assert!(may_renew(&just_tried, 10_000_000 + RENEWAL_INTERVAL_MS));
+
+        // A timestamp from the future (a clock moved backwards) must not
+        // underflow into permitting every poll.
+        assert!(!may_renew(&just_tried, 5_000_000));
+    }
+
+    #[test]
+    fn a_cache_predating_renewal_tracking_still_parses() {
+        // Upgrading over an existing cache must not wipe it or panic.
+        let cache: CachedLimits = serde_json::from_str(r#"{"windows":[],"savedAt":1786450354868}"#)
+            .expect("should parse");
+        assert_eq!(cache.renewal_attempted_at, None);
+        assert!(may_renew(&cache, 1_786_450_354_868));
     }
 
     #[test]
