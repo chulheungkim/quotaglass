@@ -1,6 +1,6 @@
 use super::{
     ActivityPoint, BreakdownRow, ProviderId, ProviderLimit, ProviderLimits, ProviderStats,
-    SummaryMetric,
+    StaleKind, SummaryMetric,
 };
 use crate::{app_support_dir, codex_rpc::CodexAppServer, date_from_secs, now_ms, today_date};
 use serde::{Deserialize, Serialize};
@@ -223,6 +223,7 @@ fn parse_limits(
         stale,
         cached_at,
         stale_reason: stale.then(|| "Codex app-server unavailable".to_string()),
+        stale_kind: stale.then_some(StaleKind::Unreachable),
         plan,
         credit_balance,
     })

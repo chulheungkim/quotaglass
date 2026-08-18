@@ -20,6 +20,26 @@ pub struct ProviderLimit {
     pub window_minutes: Option<i64>,
 }
 
+// What kind of failure put a card on cache, classified at the branch that
+// actually failed. The frontend needs this to say something useful, and the
+// only other source is the API's error prose — which is server-controlled and
+// would silently stop matching the moment the wording changes.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StaleKind {
+    // Every stored token was already past its expiry when the request went out.
+    // Only a Claude Code session can renew it, so this one is actionable.
+    TokenExpired,
+    // No usable token in either store: the user has never signed in, or signed out.
+    NotSignedIn,
+    // The endpoint asked us to back off. Transient, resolves on its own.
+    RateLimited,
+    // The request never reached the endpoint at all.
+    Unreachable,
+    // Anything else. The reason string carries whatever detail exists.
+    Unknown,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderLimits {
@@ -30,6 +50,8 @@ pub struct ProviderLimits {
     // Why the card is serving cache rather than live data. Without this the
     // widget can sit on month-old numbers with no way for anyone to tell why.
     pub stale_reason: Option<String>,
+    // The same failure as a stable value the frontend can branch on.
+    pub stale_kind: Option<StaleKind>,
     pub plan: Option<String>,
     pub credit_balance: Option<String>,
 }
@@ -100,6 +122,7 @@ mod tests {
             stale: false,
             cached_at: None,
             stale_reason: None,
+            stale_kind: None,
             plan: Some("plus".into()),
             credit_balance: None,
         };

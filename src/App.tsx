@@ -26,7 +26,12 @@ import {
   saveViewMode,
 } from "./provider";
 import type { ProviderId, ViewMode } from "./provider";
-import type { ProviderLimit, ProviderLimits, ProviderStats } from "./types";
+import type {
+  ProviderLimit,
+  ProviderLimits,
+  ProviderStats,
+  StaleKind,
+} from "./types";
 import { collectAsyncDisposers } from "./asyncDisposers";
 
 const NAMES: Record<string, string> = {
@@ -86,6 +91,39 @@ function fmtKST(ms: number): string {
       timeZone: "Asia/Seoul",
     }) + " KST"
   );
+}
+
+// Short cause shown next to the cached timestamp. A bare "Cached 20:17:03 KST"
+// reads like a recent successful refresh, so an outage lasting hours looks
+// identical to a blip that will clear itself on the next poll.
+const STALE_CAUSE: Record<StaleKind, string> = {
+  tokenExpired: "token expired",
+  notSignedIn: "not signed in",
+  rateLimited: "rate limited",
+  unreachable: "no response",
+  unknown: "usage unavailable",
+};
+
+// The one failure the user can actually clear, so it states the remedy and drops
+// the timestamp — that number is what makes a multi-hour outage look fresh, and
+// the room it frees is what the remedy needs.
+// `kind` is whatever Rust serialized, asserted to the union rather than
+// validated, so a variant added there and not mirrored here must not reach the
+// user as the string "undefined".
+function staleCause(kind: StaleKind | null): string {
+  return kind !== null && kind in STALE_CAUSE
+    ? STALE_CAUSE[kind]
+    : STALE_CAUSE.unknown;
+}
+
+function staleFooter(kind: StaleKind | null, cachedAt: number | null): string {
+  if (kind === "tokenExpired") {
+    return "Cached — token expired, open Claude Code";
+  }
+  const cause = staleCause(kind);
+  return cachedAt === null
+    ? `Cached — ${cause}`
+    : `Cached ${fmtKST(cachedAt)} — ${cause}`;
 }
 
 function formatReset(isoString: string): string {
@@ -397,10 +435,17 @@ export default function App() {
         setRefreshedAt(data.stale ? data.cachedAt : Date.now());
         setRefreshedVisible(true);
         clearTimeout(hideTimerRef.current);
-        hideTimerRef.current = setTimeout(
-          () => setRefreshedVisible(false),
-          3500,
-        );
+        // A confirmation of a successful refresh has done its job after a few
+        // seconds, but the cause of a stale card is the only thing explaining
+        // why the numbers have stopped moving. Leave that one pinned: an outage
+        // lasting hours would otherwise announce itself in 3.5s flashes that are
+        // easy to never catch.
+        if (!data.stale) {
+          hideTimerRef.current = setTimeout(
+            () => setRefreshedVisible(false),
+            3500,
+          );
+        }
       } catch (error) {
         if (providerRef.current === requestedProvider) {
           setLimitsErr(String(error));
@@ -693,13 +738,11 @@ export default function App() {
                 className="refreshed-at"
                 title={limits?.staleReason ?? undefined}
               >
-                {refreshedAt === null
-                  ? limits?.stale
-                    ? `Cached — ${limits.staleReason ?? "live usage unavailable"}`
-                    : ""
-                  : `${limits?.stale ? "Cached" : "Refreshed"} ${fmtKST(
-                      refreshedAt,
-                    )}`}
+                {limits?.stale
+                  ? staleFooter(limits.staleKind, refreshedAt)
+                  : refreshedAt === null
+                    ? ""
+                    : `Refreshed ${fmtKST(refreshedAt)}`}
               </div>
             </div>
           </div>

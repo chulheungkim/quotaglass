@@ -38,6 +38,17 @@ usage endpoint. Claude Code stores its OAuth blob in either the macOS Keychain
 on the install — read both and take the token valid longest, or the widget goes
 silently stale when the CLI switches storage.
 
+That token lasts eight hours and only a running Claude Code session renews it,
+so a gap in usage leaves the widget on cache until the next session. When a
+request is rejected and the stored token was already expired, the widget shells
+out to `claude doctor`, which renews and stores a new token as a side effect,
+then retries once. Never perform the OAuth refresh here: Anthropic rotates
+refresh tokens, and a widget writing the rotated blob back races the CLI and can
+sign the user out. The delegation is throttled to one attempt per ten minutes
+and is verified rather than assumed — the retry only happens if the stored
+expiry actually moved forward, so a CLI release that drops this undocumented
+side effect degrades to the old cache-fallback behaviour instead of breaking.
+
 A successful usage response is authoritative: a window the API omits has no
 usage, so it is dropped rather than backfilled from cache. Only a failed fetch
 falls back to cache, and expired cached windows are discarded instead of shown.
