@@ -17,7 +17,37 @@ use std::{
 // The usage endpoint budgets requests per account. When it pushes back we stop
 // calling it for a while instead of retrying on every poll, focus event and
 // manual refresh — retrying through a 429 is what keeps a card pinned to cache.
+//
+// A flat interval is not enough on its own: once the account is throttled, one
+// request every ten minutes is still enough to stay throttled, and the card then
+// never escapes. Double the wait per consecutive rejection so a sustained
+// throttle decays into a handful of requests an hour instead of six.
 const RATE_LIMIT_BACKOFF_MS: u64 = 10 * 60 * 1000;
+const RATE_LIMIT_BACKOFF_CAP_MS: u64 = 60 * 60 * 1000;
+
+// How long to wait after `strikes` consecutive rejections, counting the one
+// being handled. The endpoint's own `Retry-After` wins when it asks for longer;
+// this is the floor for the common case where it sends no such header.
+fn rate_limit_backoff_ms(strikes: u32) -> u64 {
+    let doublings = strikes.saturating_sub(1).min(3);
+    RATE_LIMIT_BACKOFF_MS
+        .saturating_mul(1u64 << doublings)
+        .min(RATE_LIMIT_BACKOFF_CAP_MS)
+}
+
+// A backoff that can be anything from ten minutes to an hour has to say which.
+// When every cached window has expired there is nothing else on the card at all,
+// so this string is the entire explanation the user gets — and a bare "rate
+// limited" reads identically whether the next try is seconds or an hour away.
+fn rate_limited_message(retry_at: u64, now: u64) -> String {
+    let remaining = retry_at.saturating_sub(now);
+    if remaining == 0 {
+        return "Usage endpoint rate limited".to_string();
+    }
+    // Round up, so the last fifty seconds of a wait never reads as "0 min".
+    let minutes = remaining.div_ceil(60_000).max(1);
+    format!("Usage endpoint rate limited — retrying in {minutes} min")
+}
 
 // Renewal spawns the full Claude Code binary, so it must not run on every poll.
 // One attempt per interval is enough: a token the CLI declined to renew will
@@ -55,6 +85,11 @@ struct CachedLimits {
     windows: Vec<ProviderLimit>,
     saved_at: Option<u64>,
     retry_after: Option<u64>,
+    // Consecutive rejections by the endpoint, reset by the first success. Drives
+    // the exponential part of the backoff, and has to survive a restart or a
+    // widget relaunched every few minutes resets itself to the shortest wait.
+    #[serde(default)]
+    rate_limit_strikes: Option<u32>,
     // When renewal was last asked of the CLI, so a failing renewal cannot spawn
     // the binary once a minute forever.
     #[serde(default)]
@@ -67,10 +102,29 @@ struct CachedLimits {
     seven_day: Option<LimitWindow>,
 }
 
+// The order the card reads top to bottom: the window that moves fastest first,
+// then the week, then anything scoped to a single model. Live responses are
+// ranked as they are parsed, but a cache written by an older build carries
+// whatever order that build stored, so rank on the way out too and the card can
+// never render the session row below the weekly ones.
+fn window_rank(id: &str) -> u8 {
+    match id {
+        "five-hour" => 0,
+        "seven-day" => 1,
+        _ => 2,
+    }
+}
+
+fn sort_windows(windows: &mut [ProviderLimit]) {
+    windows.sort_by_key(|window| window_rank(&window.id));
+}
+
 impl CachedLimits {
     fn windows(&self) -> Vec<ProviderLimit> {
         if !self.windows.is_empty() {
-            return self.windows.clone();
+            let mut windows = self.windows.clone();
+            sort_windows(&mut windows);
+            return windows;
         }
         [
             ("five-hour", "Current session", 300, &self.five_hour),
@@ -112,7 +166,17 @@ impl CachedLimits {
 struct UsageResponse {
     status: u32,
     body: String,
+    // Seconds the endpoint asked us to wait, from its `Retry-After` header.
+    retry_after_secs: Option<u64>,
 }
+
+// A long-lived token from `claude setup-token` cannot serve this endpoint: that
+// command only ever requests the `user:inference` scope, and the usage endpoint
+// requires `user:profile`, answering 403 `oauth_scope_insufficient`. Claude
+// Code's own session token carries both, which is why it works and a pasted
+// long-lived token never can. Anything that gives the widget a token of its own
+// therefore has to run a fresh authorization asking for `user:profile`, not
+// reuse the one the CLI hands out for scripting.
 
 pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
     let cache_path = support_dir.join("claude-rate-limits-cache.json");
@@ -121,10 +185,11 @@ pub fn get_limits(support_dir: &Path) -> Result<ProviderLimits, String> {
         .or_else(|| load_json(&legacy_cache_path))
         .unwrap_or_default();
 
-    if cache.retry_after.is_some_and(|until| now_ms() < until) {
+    let now = now_ms();
+    if let Some(retry_at) = cache.retry_after.filter(|until| now < *until) {
         return limits_from_cache(
             &cache,
-            "Usage endpoint rate limited",
+            &rate_limited_message(retry_at, now),
             StaleKind::RateLimited,
         );
     }
@@ -191,22 +256,32 @@ fn fetch_windows(
     // either way so the API stays authoritative, but knowing this up front is
     // what lets a rejection be reported as an expired token rather than as an
     // opaque authentication error the user can do nothing with.
-    let token_expired = token_is_expired(token, now_ms());
+    let now = now_ms();
+    let token_expired = token_is_expired(token, now);
 
     let response = fetch_usage(&token.access_token).map_err(|error| FetchFailure {
         message: error,
         kind: StaleKind::Unreachable,
     })?;
     if response.status == 429 {
+        let strikes = cache.rate_limit_strikes.unwrap_or(0).saturating_add(1);
+        // The endpoint's own answer beats our guess whenever it gives one, but
+        // never shortens the wait below the backoff the strike count earns.
+        let wait = response
+            .retry_after_secs
+            .map(|seconds| seconds.saturating_mul(1000))
+            .unwrap_or(0)
+            .max(rate_limit_backoff_ms(strikes));
         save_json_atomic(
             cache_path,
             &CachedLimits {
-                retry_after: Some(now_ms() + RATE_LIMIT_BACKOFF_MS),
+                retry_after: Some(now + wait),
+                rate_limit_strikes: Some(strikes),
                 ..cache.preserving()
             },
         );
         return Err(FetchFailure {
-            message: "Usage endpoint rate limited".to_string(),
+            message: rate_limited_message(now + wait, now),
             kind: StaleKind::RateLimited,
         });
     }
@@ -241,6 +316,7 @@ fn fetch_windows(
             windows: live.clone(),
             saved_at: Some(now_ms()),
             retry_after: None,
+            rate_limit_strikes: None,
             renewal_attempted_at: None,
             five_hour: None,
             seven_day: None,
@@ -390,6 +466,11 @@ fn fetch_usage(token: &str) -> Result<UsageResponse, String> {
             "-s",
             "--max-time",
             "8",
+            // Headers are dumped to a separate stream rather than prepended to
+            // the body, so a header value can never be mistaken for JSON and a
+            // redirect cannot leave two header blocks glued to one payload.
+            "--dump-header",
+            "/dev/stderr",
             "-w",
             "\n%{http_code}",
             "-H",
@@ -404,10 +485,27 @@ fn fetch_usage(token: &str) -> Result<UsageResponse, String> {
     let (body, status) = raw
         .rsplit_once('\n')
         .ok_or_else(|| "Usage endpoint returned no response".to_string())?;
+    let headers = String::from_utf8_lossy(&output.stderr);
     Ok(UsageResponse {
         status: status.trim().parse().unwrap_or(0),
         body: body.to_string(),
+        retry_after_secs: parse_retry_after(&headers),
     })
+}
+
+// `Retry-After` is defined as either a delay in seconds or an HTTP date. Only
+// the numeric form is honoured: the date form needs a parsed server clock to be
+// meaningful, and guessing wrong there would either hammer the endpoint or mute
+// the card for hours. An unparsed header just falls back to our own backoff.
+fn parse_retry_after(headers: &str) -> Option<u64> {
+    headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        // A server asking for a week is either confused or hostile; either way
+        // the card should try again long before then.
+        .map(|seconds| seconds.min(RATE_LIMIT_BACKOFF_CAP_MS / 1000))
 }
 
 pub fn get_stats() -> Result<ProviderStats, String> {
@@ -1156,6 +1254,86 @@ mod tests {
         // the actual instruction is to wait.
         assert_eq!(rejection_kind(true, true), StaleKind::RateLimited);
         assert_eq!(rejection_kind(false, true), StaleKind::RateLimited);
+    }
+
+    #[test]
+    fn a_rate_limited_card_says_how_long_the_wait_is() {
+        // With every cached window expired this string is the whole card, so it
+        // has to distinguish a ten-minute wait from an hour-long one.
+        assert_eq!(
+            rate_limited_message(10_000, 0),
+            "Usage endpoint rate limited — retrying in 1 min"
+        );
+        assert_eq!(
+            rate_limited_message(60 * 60 * 1000, 0),
+            "Usage endpoint rate limited — retrying in 60 min"
+        );
+        // Rounds up rather than down: 9m50s must not read as 9 min and then
+        // still be waiting when the user looks again.
+        assert_eq!(
+            rate_limited_message(590_000, 0),
+            "Usage endpoint rate limited — retrying in 10 min"
+        );
+        // A wait already in the past drops the clause instead of claiming 1 min.
+        assert_eq!(
+            rate_limited_message(1_000, 5_000),
+            "Usage endpoint rate limited"
+        );
+    }
+
+    #[test]
+    fn the_backoff_doubles_per_strike_and_stops_at_the_cap() {
+        assert_eq!(rate_limit_backoff_ms(1), RATE_LIMIT_BACKOFF_MS);
+        assert_eq!(rate_limit_backoff_ms(2), 2 * RATE_LIMIT_BACKOFF_MS);
+        assert_eq!(rate_limit_backoff_ms(3), 4 * RATE_LIMIT_BACKOFF_MS);
+        // Sixth strike would be 320 minutes without the cap, which would mute
+        // the card for most of a working day.
+        assert_eq!(rate_limit_backoff_ms(6), RATE_LIMIT_BACKOFF_CAP_MS);
+        // A zero strike count must not underflow into the cap.
+        assert_eq!(rate_limit_backoff_ms(0), RATE_LIMIT_BACKOFF_MS);
+    }
+
+    #[test]
+    fn retry_after_is_read_from_the_header_block_when_it_is_numeric() {
+        let headers = "HTTP/2 429\r\ncontent-type: application/json\r\nRetry-After: 42\r\n\r\n";
+        assert_eq!(parse_retry_after(headers), Some(42));
+        // Case-insensitive, per RFC 9110.
+        assert_eq!(parse_retry_after("retry-after: 7\r\n"), Some(7));
+        // The HTTP-date form is deliberately ignored rather than guessed at.
+        assert_eq!(
+            parse_retry_after("Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_retry_after("content-type: application/json\r\n"),
+            None
+        );
+        // A hostile or confused delay is clamped to the cap.
+        assert_eq!(
+            parse_retry_after("Retry-After: 604800\r\n"),
+            Some(RATE_LIMIT_BACKOFF_CAP_MS / 1000)
+        );
+    }
+
+    #[test]
+    fn cached_windows_are_ordered_session_then_week_then_scoped() {
+        // A cache written by an older build can hold any order. The card's
+        // contract is session first, so rank on the way out rather than trusting
+        // whatever is on disk.
+        let cache = CachedLimits {
+            windows: vec![
+                cached_window("seven-day-fable", "2099-01-01T00:00:00Z"),
+                cached_window("seven-day", "2099-01-01T00:00:00Z"),
+                cached_window("five-hour", "2099-01-01T00:00:00Z"),
+            ],
+            ..CachedLimits::default()
+        };
+        let ids: Vec<_> = cache
+            .windows()
+            .into_iter()
+            .map(|window| window.id)
+            .collect();
+        assert_eq!(ids, ["five-hour", "seven-day", "seven-day-fable"]);
     }
 
     #[test]
