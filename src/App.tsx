@@ -50,12 +50,32 @@ const COLORS: Record<string, string> = {
 };
 const FALLBACKS = ["#8B6FBF", "#4A90D9", "#4AC9A0", "#D9844A", "#C95A8B"];
 
-// The short rolling window moves continuously while an agent is working, so
-// limits are polled on their own, tighter clock than the local stats scan.
-const LIMITS_POLL_INTERVAL_MS = 60_000;
-// Floor between two non-explicit limit fetches, so bursts of session writes or
-// repeated show/hide never turn into a burst of metered API calls.
-const MIN_LIMITS_INTERVAL_MS = 20_000;
+// The windows this card shows are five hours and a week wide, so fine-grained
+// polling buys nothing and costs the whole card: the usage endpoint is metered
+// per account, and once it throttles it serves 429s with Retry-After values
+// measured in tens of minutes. At this interval a five-hour window advances
+// about 5% between refreshes, which is under one bar-width on a 300px card.
+const LIMITS_POLL_INTERVAL_MS = 900_000;
+// Floor between two non-explicit limit fetches. This governs the activity- and
+// focus-driven refreshes, which are the real volume: `usage-updated` fires on
+// every local session write, so a short floor here turns an ordinary working
+// session into a sustained poll of a metered endpoint regardless of the
+// interval above. Five minutes still tracks a window that takes five hours
+// to fill.
+const MIN_LIMITS_INTERVAL_MS = 300_000;
+
+// Ask Tauri, not `document.visibilityState`: the widget is hidden by an
+// NSWindow operation from the tray item, the close button and a global
+// shortcut, and the webview is not reliably notified of any of them.
+async function widgetIsVisible(): Promise<boolean> {
+  try {
+    return await getCurrentWindow().isVisible();
+  } catch {
+    // If visibility cannot be determined, refresh anyway: a card that silently
+    // stops updating is a worse failure than one metered call too many.
+    return true;
+  }
+}
 
 function modelLabel(key: string): string {
   if (NAMES[key]) return NAMES[key];
@@ -280,23 +300,34 @@ function AnimatedLimitRows({
     const nextByKey = new Map(nextItems.map((item) => [item.key, item]));
 
     setRows((current) => {
-      const currentKeys = new Set(current.map((row) => row.key));
-      const reconciled = current.map((row): TransitionLimitRow => {
-        const next = nextByKey.get(row.key);
-        if (!next) {
-          return { ...row, phase: "exiting", transition };
+      const currentByKey = new Map(current.map((row) => [row.key, row]));
+
+      // Order follows the incoming list, not the list already on screen.
+      // Appending new rows instead is what used to sink the five-hour window to
+      // the bottom and leave it there: it is dropped whenever it expires, and
+      // the row that comes back after a refresh is a new key to the animation.
+      const reconciled = nextItems.map((item): TransitionLimitRow => {
+        const existing = currentByKey.get(item.key);
+        if (!existing || existing.phase === "exiting") {
+          return { ...item, phase: "entering", transition };
         }
-        if (row.phase === "exiting") {
-          return { ...next, phase: "entering", transition };
-        }
-        return { ...next, phase: row.phase, transition: row.transition };
+        return {
+          ...item,
+          phase: existing.phase,
+          transition: existing.transition,
+        };
       });
 
-      for (const item of nextItems) {
-        if (!currentKeys.has(item.key)) {
-          reconciled.push({ ...item, phase: "entering", transition });
-        }
-      }
+      // Rows on their way out keep the slot they occupied, so the rest of the
+      // list does not jump while one of them collapses.
+      current.forEach((row, index) => {
+        if (nextByKey.has(row.key)) return;
+        reconciled.splice(Math.min(index, reconciled.length), 0, {
+          ...row,
+          phase: "exiting",
+          transition,
+        });
+      });
       return reconciled;
     });
 
@@ -415,11 +446,17 @@ export default function App() {
       // Activity- and focus-driven refreshes can arrive in bursts. The usage
       // endpoints are metered, so anything but an explicit refresh is spaced
       // out; getting rate limited is what forces the card onto cache.
-      if (
-        !force &&
-        Date.now() - limitsFetchedAtRef.current < MIN_LIMITS_INTERVAL_MS
-      ) {
-        return;
+      if (!force) {
+        if (Date.now() - limitsFetchedAtRef.current < MIN_LIMITS_INTERVAL_MS) {
+          return;
+        }
+        // Nothing is reading the card while the widget is hidden, so spending a
+        // metered request on it is pure waste — and the budget it wastes is the
+        // one the next visible refresh needs. Showing the window focuses it,
+        // and the focus handler refreshes, so nothing is lost by skipping here.
+        if (!(await widgetIsVisible())) {
+          return;
+        }
       }
       limitsFetchedAtRef.current = Date.now();
       setLoadingLimits(true);
@@ -474,7 +511,12 @@ export default function App() {
 
   useEffect(() => {
     loadLimits();
-    const interval = setInterval(loadLimits, LIMITS_POLL_INTERVAL_MS);
+    // Unforced, so the background clock is subject to the visibility check and
+    // the shared floor; only the first load and an explicit refresh bypass them.
+    const interval = setInterval(
+      () => void loadLimits({ force: false }),
+      LIMITS_POLL_INTERVAL_MS,
+    );
     return () => clearInterval(interval);
   }, [loadLimits]);
 
